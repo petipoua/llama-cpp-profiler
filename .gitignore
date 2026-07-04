@@ -1,0 +1,4 @@
+/target/
+/.llama-cpp-profiler/
+*.log
+*.tmp
