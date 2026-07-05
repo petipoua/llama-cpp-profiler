@@ -43,6 +43,7 @@ struct AgentMetric {
     model_kind: crate::gguf::ModelKind,
     quant: Option<String>,
     native_context: Option<u64>,
+    profile_key: String,
     profile_id: String,
     source_run_id: String,
     source_candidate_id: String,
@@ -344,7 +345,7 @@ fn print_agent_report(profiled: &[(GgufMetadata, RecommendationFile)]) -> Result
     let best_profile_ids = all_profiles
         .iter()
         .take(5)
-        .map(|(_, profile)| profile.id.clone())
+        .map(|(metadata, profile)| crate::runner::profile_key(&metadata.path, profile))
         .collect::<Vec<_>>();
     let exact_command = all_profiles
         .first()
@@ -360,6 +361,7 @@ fn print_agent_report(profiled: &[(GgufMetadata, RecommendationFile)]) -> Result
             model_kind: metadata.model_kind.clone(),
             quant: metadata.quant.clone(),
             native_context: metadata.native_context,
+            profile_key: crate::runner::profile_key(&metadata.path, profile),
             profile_id: profile.id.clone(),
             source_run_id: profile.source_run_id.clone(),
             source_candidate_id: profile.source_candidate_id.clone(),
