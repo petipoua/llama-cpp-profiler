@@ -1,3 +1,4 @@
+pub mod environment;
 pub mod gguf;
 pub mod profile;
 pub mod report;
