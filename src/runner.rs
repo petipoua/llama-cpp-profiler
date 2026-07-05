@@ -137,8 +137,13 @@ struct RunRequest {
 
 #[derive(Debug, Clone)]
 enum PromptPlan {
-    Tune { ingest_target_tokens: u64 },
-    FullCtx { target_tokens: u64 },
+    Tune {
+        ingest_target_tokens: u64,
+        near_full_ingest_tokens: Option<u64>,
+    },
+    FullCtx {
+        target_tokens: u64,
+    },
 }
 
 pub async fn run_tune(path: &Path, options: TuneOptions) -> Result<RecommendationFile> {
@@ -213,6 +218,11 @@ pub async fn run_tune(path: &Path, options: TuneOptions) -> Result<Recommendatio
             port,
             prompt_plan: PromptPlan::Tune {
                 ingest_target_tokens: options.preset.ingest_target_tokens(),
+                near_full_ingest_tokens: options.near_full_ingest.then(|| {
+                    options
+                        .near_full_target_tokens
+                        .unwrap_or_else(|| near_full_ingest_target(requested_context))
+                }),
             },
         };
         let validation_level = if options.preset == Preset::Quick {
@@ -737,6 +747,7 @@ async fn drive_probes(
     match request.prompt_plan {
         PromptPlan::Tune {
             ingest_target_tokens,
+            near_full_ingest_tokens,
         } => {
             let output_prompt =
                 "Write a concise checklist for safely profiling a local llama.cpp model.";
@@ -768,6 +779,24 @@ async fn drive_probes(
             request_artifact.push(ingest.request_json.clone());
             response_artifact.push(ingest.response_json.clone());
             probes.insert("ingest".to_string(), summary);
+
+            if let Some(target_tokens) = near_full_ingest_tokens {
+                let (prompt, estimate) = repeated_license_prompt(target_tokens);
+                let near_full = post_chat_completion(
+                    base_url,
+                    &metadata.display_name(),
+                    &prompt,
+                    1,
+                    REQUEST_TIMEOUT,
+                )
+                .await
+                .context("near-full ingest probe")?;
+                let mut summary = near_full.summary;
+                summary.prompt_tokens = Some(estimate);
+                request_artifact.push(near_full.request_json.clone());
+                response_artifact.push(near_full.response_json.clone());
+                probes.insert("near_full_ingest".to_string(), summary);
+            }
         }
         PromptPlan::FullCtx { target_tokens } => {
             let (full_prompt, estimate) = repeated_license_prompt(target_tokens);
@@ -1302,6 +1331,16 @@ fn repeated_license_prompt(target_tokens: u64) -> (String, u64) {
     }
     let estimate = estimate_tokens(&prompt);
     (prompt, estimate)
+}
+
+fn near_full_ingest_target(requested_context: u64) -> u64 {
+    if requested_context <= 2_048 {
+        return requested_context.saturating_mul(3) / 4;
+    }
+    let ratio_target = requested_context.saturating_mul(94) / 100;
+    ratio_target
+        .min(requested_context.saturating_sub(1024))
+        .max(1)
 }
 
 fn estimate_tokens(text: &str) -> u64 {
