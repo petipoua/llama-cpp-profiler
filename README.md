@@ -3,6 +3,8 @@
 `llama-cpp-profiler` is a Rust CLI for empirically profiling GGUF models with
 `llama-server`. It discovers models, runs bounded probes, captures server logs
 and machine telemetry, ranks usable configs, and writes agent-readable reports.
+Recommendations are tied to the hardware and `llama-server` environment that
+produced them, so stale runs are kept as evidence but not used for best profiles.
 
 The core tool is about `llama.cpp` server behavior. Client harnesses such as
 opencode are optional export adapters because they only call the OpenAI-compatible
@@ -60,6 +62,18 @@ llama-cpp-profiler tune ~/Models/<model-or-gguf> --ctx 262144 --preset standard
 runs sanity/output/ingest probes, writes raw artifacts, and stops the server after
 each candidate. It does not run a 250k-token prompt.
 
+Preview the hardware-aware candidate plan without starting servers:
+
+```bash
+llama-cpp-profiler tune ~/Models/<model-or-gguf> --ctx 262144 --preset quick --plan
+```
+
+Inspect the current profiler, hardware, and server environment:
+
+```bash
+llama-cpp-profiler doctor --json
+```
+
 Run explicit near-full context:
 
 ```bash
@@ -74,11 +88,12 @@ Read ranked recommendations:
 ```bash
 llama-cpp-profiler report ~/Models
 llama-cpp-profiler report ~/Models --agent
+llama-cpp-profiler report ~/Models --include-stale
 ```
 
 The human report prints comparison tables. `--agent` emits compact JSON with best
-profile ids, the exact best command, key metrics, failures, and the next suggested
-test.
+profile ids, source run/candidate/context, validation level, the exact best
+command, key metrics, failures, stale runs, and the next suggested test.
 
 Export managed notes or client labels:
 
@@ -99,10 +114,11 @@ that points at the running `llama-server` endpoint.
 ```bash
 llama-cpp-profiler scan PATH [--no-tui]
 llama-cpp-profiler inspect PATH [--json]
-llama-cpp-profiler tune PATH [--ctx TOKENS] [--preset quick|standard|thorough] [--max-runs N]
+llama-cpp-profiler tune PATH [--ctx TOKENS] [--preset quick|standard|thorough] [--max-runs N] [--plan --json]
 llama-cpp-profiler fullctx PATH [--profile ID] [--target-tokens TOKENS]
-llama-cpp-profiler report PATH [--agent]
-llama-cpp-profiler serve PATH [--profile ID] [--port PORT] [--print]
+llama-cpp-profiler report PATH [--agent] [--include-stale]
+llama-cpp-profiler serve PATH [--profile ID] [--port PORT] [--print] [--allow-stale]
+llama-cpp-profiler doctor [--json]
 llama-cpp-profiler export PATH [--markdown] [--opencode PATH] [--dry-run] [--write]
 ```
 
@@ -113,6 +129,7 @@ llama-cpp-profiler export PATH [--markdown] [--opencode PATH] [--dry-run] [--wri
 - Safety defaults are `--min-vram-free-mib 512` and `--max-swap-delta-mib 1024`.
 - `quick` runs at most 6 candidates; `standard` runs at most 16; `thorough` runs a broader sweep.
 - `fullctx` is the only command that targets near-full prompts.
+- Stale or legacy runs are excluded from best-profile selection by default.
 - Export is dry-run unless `--write` is present.
 
 ### Artifacts
@@ -135,11 +152,12 @@ Each model directory gets:
 
 `result.json` stores the exact command, GGUF metadata, probe summaries, parsed
 llama.cpp timing lines, client-observed TTFT, telemetry peaks/minimums, outcome,
-and paths to raw artifacts.
+environment snapshot, validation level, and paths to raw artifacts.
 
 ### Profiles
 
-Recommendations are derived from passed runs and safety limits:
+Recommendations are derived from current-environment passed runs and safety
+limits:
 
 - `interactive-fast`: highest generation tok/s within safety limits.
 - `interactive-safe`: highest generation tok/s with at least 1 GiB free VRAM.

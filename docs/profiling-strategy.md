@@ -9,6 +9,7 @@ The profiler records evidence that applies to any `llama-server` client:
 
 - exact GGUF path and metadata
 - exact `llama-server` command
+- profiler, hardware, GPU, driver, and `llama-server` environment snapshot
 - context, batch, microbatch, KV cache, fit target, and MoE placement
 - prompt ingest throughput
 - generation throughput
@@ -20,6 +21,10 @@ The profiler records evidence that applies to any `llama-server` client:
 Client harnesses such as opencode are not part of the core scoring model. They
 can be exported as labels that point at the server endpoint, but the running
 `llama-server` process determines the actual GGUF and runtime config.
+
+Recommendations are environment-bound. If the GPU, driver, CPU/RAM shape, or
+`llama-server` executable/help output changes, old runs are kept as stale
+evidence and excluded from best-profile selection.
 
 ## Dense Models
 
@@ -33,6 +38,10 @@ Dense models usually have no MoE offload escape hatch, so the useful sweep is:
 Dense recommendations should be skeptical of speed gains that leave very little
 VRAM headroom. Lower quant can improve output speed, but at long context the KV
 and compute-buffer fit often dominate.
+
+Candidate planning uses the current environment snapshot to keep likely-safe
+candidates ahead of aggressive ones. The sweep remains intentionally bounded;
+`tune --plan --json` exposes the ordered candidates without starting servers.
 
 ## MoE Models
 
@@ -74,3 +83,6 @@ Profiles are selected from runs that pass safety limits:
 
 Rejected runs keep their reason: OOM, timeout, server crash, too-tight VRAM,
 swap-thrashing, interrupted, or parse-partial.
+
+Legacy or changed-environment runs are listed separately as stale. They are not
+used for scoring unless a future command explicitly opts into diagnostic display.

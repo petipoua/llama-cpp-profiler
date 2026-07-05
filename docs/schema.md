@@ -1,6 +1,9 @@
 # Data Schemas
 
-The schemas are versioned by `schema_version`. Version `1` is the initial format.
+The schemas are versioned by `schema_version`. Version `2` adds environment
+snapshots, compatibility status, validation levels, and richer agent metadata.
+Version `1` result files are read best-effort and treated as legacy stale runs
+because they do not contain environment snapshots.
 
 ## `result.json`
 
@@ -16,8 +19,12 @@ Important fields:
 - `command`: argv array used to launch `llama-server`.
 - `command_display`: shell-escaped command string.
 - `candidate`: generated tuning config: context, batch, microbatch, KV cache type, fit target, and MoE placement flags.
+- `candidate.expected_risk`, `candidate.planning_note`: hardware-aware planning annotations.
 - `test_kind`: `tune` or `fullctx`.
 - `requested_context`: context passed to the server.
+- `validation_level`: `smoke`, `standard_ingest`, or `fullctx`.
+- `environment`: profiler, OS, CPU, memory, GPU, and `llama-server` snapshot.
+- `compatibility`: `current`, `legacy_missing_snapshot`, `server_changed`, or `hardware_changed`.
 - `prompt_tokens`, `completion_tokens`: best available token counts, preferring server timing lines.
 - `metrics.server_prompt_eval_toks_per_s`: parsed from llama.cpp `prompt eval time`.
 - `metrics.server_generation_toks_per_s`: parsed from llama.cpp `eval time`.
@@ -42,6 +49,8 @@ Important fields:
 - `model_path`
 - `profiles`: ranked profile recommendations.
 - `rejected`: failed, OOM, timeout, swap-heavy, or too-tight candidate summaries.
+- `stale`: legacy or changed-environment run summaries excluded from ranking.
+- `environment`: current environment used when rebuilding recommendations.
 - `next_suggested_test`: a compact next action for future agents.
 
 Each profile contains:
@@ -49,6 +58,8 @@ Each profile contains:
 - `id`: `interactive-fast`, `interactive-safe`, `prompt-replay`, `balanced`, or `quality-night`.
 - `role`: human-readable role.
 - `source_run_id`: run that produced the profile.
+- `source_candidate_id`, `source_test_kind`, `requested_context`
+- `validated_prompt_tokens`, `validation_level`, `compatibility`
 - `command`, `command_display`: exact `llama-server` command.
 - `output_toks_per_s`, `prompt_toks_per_s`, `ttft_ms`
 - `peak_vram_mib`, `headroom_mib`
@@ -59,8 +70,8 @@ Each profile contains:
 
 Markdown reports put the comparison table first:
 
-| Profile | Role | Output tok/s | Prompt tok/s | TTFT | Peak VRAM | Headroom | Risk | Command |
-|---|---|---:|---:|---:|---:|---:|---|---|
+| Profile | Role | Output tok/s | Prompt tok/s | TTFT | Peak VRAM | Headroom | Risk | Validation | Command |
+|---|---|---:|---:|---:|---:|---:|---|---|---|
 
 `report --agent` prints one compact JSON object:
 
@@ -68,6 +79,11 @@ Markdown reports put the comparison table first:
 - `exact_command`
 - `key_metrics`
 - `failures`
+- `stale_profiles`
 - `next_suggested_test`
+
+Each metric includes model path, profile id, source run id, source candidate id,
+test kind, requested context, validated prompt tokens, validation level,
+compatibility, metrics, risk, and exact command.
 
 This is the main interface for future agents that need a quick, low-token answer.
