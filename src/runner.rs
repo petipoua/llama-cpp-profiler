@@ -1,8 +1,9 @@
+use crate::environment::{EnvironmentSnapshot, capture_environment, compare_environment};
 use crate::gguf::{GgufMetadata, read_metadata, resolve_model_path};
 use crate::profile::{
     ArtifactPaths, CandidateConfig, Manifest, Outcome, Preset, ProbeSummary, ProfileResult,
-    RecommendationFile, SCHEMA_VERSION, SafetyLimits, build_recommendations, command_display,
-    generate_candidates,
+    RecommendationFile, SCHEMA_VERSION, SafetyLimits, ValidationLevel, build_recommendations,
+    command_display, generate_candidates, generate_candidates_for_environment,
 };
 use crate::report;
 use crate::telemetry::TelemetrySampler;
@@ -35,6 +36,7 @@ pub struct TuneOptions {
     pub safety: SafetyLimits,
     pub port_start: u16,
     pub gpu_index: Option<u32>,
+    pub plan_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +54,7 @@ pub struct ServeOptions {
     pub profile: String,
     pub port: u16,
     pub print_only: bool,
+    pub allow_stale: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +87,10 @@ impl ServerCapabilities {
     fn supports(&self, flag: &str) -> bool {
         self.help.contains(flag)
     }
+
+    fn environment(&self) -> EnvironmentSnapshot {
+        capture_environment(&self.executable, Some(&self.help))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -105,14 +112,38 @@ pub async fn run_tune(path: &Path, options: TuneOptions) -> Result<Recommendatio
     let metadata = read_metadata(&model_path)?;
     let requested_context = metadata.context_or(options.ctx_cap);
     let capabilities = ServerCapabilities::detect()?;
-    let candidates = generate_candidates(
+    let environment = capabilities.environment();
+    let candidates = generate_candidates_for_environment(
         &metadata,
         options.preset,
         requested_context,
         options.max_runs,
+        Some(&environment),
     );
     if candidates.is_empty() {
         bail!("no candidates generated for {}", metadata.path.display());
+    }
+    if options.plan_only {
+        let plan = crate::profile::CandidatePlan {
+            schema_version: SCHEMA_VERSION,
+            generated_at: Utc::now(),
+            model_path: metadata.path.clone(),
+            requested_context,
+            preset: options.preset,
+            environment,
+            candidates,
+        };
+        println!("{}", serde_json::to_string_pretty(&plan)?);
+        return Ok(RecommendationFile {
+            schema_version: SCHEMA_VERSION,
+            generated_at: Utc::now(),
+            model_path: metadata.path,
+            profiles: Vec::new(),
+            rejected: Vec::new(),
+            stale: Vec::new(),
+            environment: None,
+            next_suggested_test: None,
+        });
     }
 
     let profiler_dir = metadata.profiler_dir();
@@ -137,12 +168,19 @@ pub async fn run_tune(path: &Path, options: TuneOptions) -> Result<Recommendatio
                 ingest_target_tokens: options.preset.ingest_target_tokens(),
             },
         };
+        let validation_level = if options.preset == Preset::Quick {
+            ValidationLevel::Smoke
+        } else {
+            ValidationLevel::StandardIngest
+        };
         let result = run_candidate(
             &metadata,
             &capabilities,
             request,
             &options.safety,
             options.gpu_index,
+            environment.clone(),
+            validation_level,
         )
         .await?;
         eprintln!(
@@ -156,8 +194,12 @@ pub async fn run_tune(path: &Path, options: TuneOptions) -> Result<Recommendatio
 
     write_manifest(&metadata)?;
     let all_results = load_prior_results(&metadata.profiler_dir())?;
-    let recommendations =
-        build_recommendations(metadata.path.clone(), &all_results, &options.safety);
+    let recommendations = build_recommendations(
+        metadata.path.clone(),
+        &all_results,
+        &options.safety,
+        Some(&environment),
+    );
     write_json(
         metadata.profiler_dir().join("recommendations.json"),
         &recommendations,
@@ -170,6 +212,7 @@ pub async fn run_fullctx(path: &Path, options: FullCtxOptions) -> Result<Profile
     let model_path = resolve_model_path(path)?;
     let metadata = read_metadata(&model_path)?;
     let capabilities = ServerCapabilities::detect()?;
+    let environment = capabilities.environment();
     let candidate =
         candidate_for_saved_profile(&metadata, &options.profile)?.unwrap_or_else(|| {
             let requested_context = metadata.context_or(options.ctx_cap);
@@ -186,7 +229,9 @@ pub async fn run_fullctx(path: &Path, options: FullCtxOptions) -> Result<Profile
                     gpu_layers: None,
                     cpu_moe: false,
                     n_cpu_moe: None,
+                    expected_risk: crate::profile::CandidateRisk::Medium,
                     note: "fallback full-context candidate".to_string(),
+                    planning_note: "fallback when no saved profile is available".to_string(),
                 })
         });
 
@@ -206,11 +251,18 @@ pub async fn run_fullctx(path: &Path, options: FullCtxOptions) -> Result<Profile
         request,
         &options.safety,
         options.gpu_index,
+        environment.clone(),
+        ValidationLevel::Fullctx,
     )
     .await?;
     write_manifest(&metadata)?;
     let results = load_prior_results(&metadata.profiler_dir())?;
-    let recommendations = build_recommendations(metadata.path.clone(), &results, &options.safety);
+    let recommendations = build_recommendations(
+        metadata.path.clone(),
+        &results,
+        &options.safety,
+        Some(&environment),
+    );
     write_json(
         metadata.profiler_dir().join("recommendations.json"),
         &recommendations,
@@ -228,6 +280,25 @@ pub async fn run_serve(path: &Path, options: ServeOptions) -> Result<()> {
         .iter()
         .find(|profile| profile.id == options.profile)
         .with_context(|| format!("profile {:?} not found", options.profile))?;
+    let current_environment = capture_current_environment_best_effort();
+    let recommendation_compatibility =
+        compare_environment(recs.environment.as_ref(), &current_environment);
+    if !options.allow_stale
+        && (!profile.compatibility.is_current() || !recommendation_compatibility.is_current())
+    {
+        bail!(
+            "profile {:?} is stale: {}; rerun tune or pass --allow-stale",
+            options.profile,
+            if !recommendation_compatibility.is_current() {
+                recommendation_compatibility.reason()
+            } else {
+                profile
+                    .stale_reason
+                    .as_deref()
+                    .unwrap_or_else(|| profile.compatibility.reason())
+            }
+        );
+    }
     let command = command_with_port(&profile.command, options.port);
     let display = command_display(&command);
 
@@ -250,12 +321,31 @@ pub async fn run_serve(path: &Path, options: ServeOptions) -> Result<()> {
     Ok(())
 }
 
+fn capture_current_environment_best_effort() -> EnvironmentSnapshot {
+    let executable = std::env::var("LLAMA_SERVER").unwrap_or_else(|_| "llama-server".to_string());
+    let help = std::process::Command::new(&executable)
+        .arg("--help")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+    capture_environment(&executable, help.as_deref())
+}
+
 async fn run_candidate(
     metadata: &GgufMetadata,
     capabilities: &ServerCapabilities,
     request: RunRequest,
     safety: &SafetyLimits,
     gpu_index: Option<u32>,
+    environment: EnvironmentSnapshot,
+    validation_level: ValidationLevel,
 ) -> Result<ProfileResult> {
     let started_at = Utc::now();
     let run_id = run_id(&request.candidate.id);
@@ -289,6 +379,8 @@ async fn run_candidate(
                     ended_at,
                     outcome: Outcome::ServerCrash,
                     note: format!("failed to start llama-server: {err:#}"),
+                    environment,
+                    validation_level,
                 },
             );
             write_json(&result.artifacts.result_json, &result)?;
@@ -401,6 +493,9 @@ async fn run_candidate(
         outcome,
         artifacts,
         note,
+        environment: Some(environment.clone()),
+        validation_level,
+        compatibility: compare_environment(Some(&environment), &environment),
     };
     write_json(&result.artifacts.result_json, &result)?;
     Ok(result)
@@ -815,6 +910,8 @@ struct FailedRun {
     ended_at: DateTime<Utc>,
     outcome: Outcome,
     note: String,
+    environment: EnvironmentSnapshot,
+    validation_level: ValidationLevel,
 }
 
 fn empty_result(metadata: &GgufMetadata, failed: FailedRun) -> ProfileResult {
@@ -840,6 +937,9 @@ fn empty_result(metadata: &GgufMetadata, failed: FailedRun) -> ProfileResult {
         outcome: failed.outcome,
         artifacts: failed.artifacts,
         note: failed.note,
+        environment: Some(failed.environment.clone()),
+        validation_level: failed.validation_level,
+        compatibility: compare_environment(Some(&failed.environment), &failed.environment),
     }
 }
 

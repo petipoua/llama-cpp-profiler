@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
+use llama_cpp_profiler::environment::capture_environment;
 use llama_cpp_profiler::gguf;
 use llama_cpp_profiler::profile::{Preset, SafetyLimits};
 use llama_cpp_profiler::report::{self, ExportOptions, ReportOptions};
@@ -30,6 +31,8 @@ enum Commands {
     Report(ReportArgs),
     /// Run or print a saved recommended llama-server profile.
     Serve(ServeArgs),
+    /// Print current profiler, hardware, and llama-server environment.
+    Doctor(DoctorArgs),
     /// Export Markdown and optional client harness snippets.
     Export(ExportArgs),
 }
@@ -66,6 +69,12 @@ struct TuneArgs {
     port_start: u16,
     #[arg(long)]
     gpu_index: Option<u32>,
+    /// Print the candidate plan as JSON and do not start llama-server.
+    #[arg(long)]
+    plan: bool,
+    /// Use JSON output with --plan.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -92,6 +101,8 @@ struct ReportArgs {
     path: PathBuf,
     #[arg(long)]
     agent: bool,
+    #[arg(long)]
+    include_stale: bool,
 }
 
 #[derive(Debug, Args)]
@@ -103,6 +114,14 @@ struct ServeArgs {
     port: u16,
     #[arg(long)]
     print: bool,
+    #[arg(long)]
+    allow_stale: bool,
+}
+
+#[derive(Debug, Args)]
+struct DoctorArgs {
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -163,6 +182,10 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Tune(args) => {
+            if args.json && !args.plan {
+                anyhow::bail!("--json is only supported with --plan");
+            }
+            let plan_only = args.plan;
             let recs = runner::run_tune(
                 &args.path,
                 TuneOptions {
@@ -175,10 +198,13 @@ async fn main() -> Result<()> {
                     },
                     port_start: args.port_start,
                     gpu_index: args.gpu_index,
+                    plan_only,
                 },
             )
             .await?;
-            println!("{}", report::markdown_for_recommendations(&recs));
+            if !plan_only {
+                println!("{}", report::markdown_for_recommendations(&recs));
+            }
         }
         Commands::Fullctx(args) => {
             let result = runner::run_fullctx(
@@ -199,7 +225,13 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Commands::Report(args) => {
-            report::print_report(&args.path, ReportOptions { agent: args.agent })?;
+            report::print_report(
+                &args.path,
+                ReportOptions {
+                    agent: args.agent,
+                    include_stale: args.include_stale,
+                },
+            )?;
         }
         Commands::Serve(args) => {
             runner::run_serve(
@@ -208,9 +240,42 @@ async fn main() -> Result<()> {
                     profile: args.profile,
                     port: args.port,
                     print_only: args.print,
+                    allow_stale: args.allow_stale,
                 },
             )
             .await?;
+        }
+        Commands::Doctor(args) => {
+            let executable =
+                std::env::var("LLAMA_SERVER").unwrap_or_else(|_| "llama-server".to_string());
+            let help = std::process::Command::new(&executable)
+                .arg("--help")
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| {
+                    format!(
+                        "{}\n{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    )
+                });
+            let snapshot = capture_environment(&executable, help.as_deref());
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&snapshot)?);
+            } else {
+                println!("profiler: {}", snapshot.profiler_version);
+                println!("os: {}", snapshot.os);
+                println!(
+                    "llama-server: {}",
+                    if snapshot.llama_server.usable {
+                        "usable"
+                    } else {
+                        "unavailable"
+                    }
+                );
+                println!("gpus: {}", snapshot.gpus.len());
+            }
         }
         Commands::Export(args) => {
             report::export(
