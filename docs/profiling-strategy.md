@@ -52,6 +52,12 @@ lower-context fallbacks. This stays within the selected preset or `--max-runs`
 budget. `tune --plan` exposes the initial ordered candidates as JSON without
 starting servers.
 
+For MoE models, `tune` and `recommend` also accept `--n-cpu-moe-values` to put
+known expert-placement boundary values at the front of the plan. This is useful
+when prior runs or neighboring models show that the important local optimum is
+around a narrow partial-MoE range such as `32,31,30`, and a bounded `quick` run
+should spend its budget there instead of on conservative baselines.
+
 ## MoE Models
 
 MoE models need a separate search because CPU/GPU expert placement changes both

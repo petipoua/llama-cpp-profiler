@@ -37,6 +37,7 @@ pub struct TuneOptions {
     pub safety: SafetyLimits,
     pub port_start: u16,
     pub gpu_index: Option<u32>,
+    pub n_cpu_moe_values: Vec<u64>,
     pub plan_only: bool,
     pub near_full_ingest: bool,
     pub near_full_target_tokens: Option<u64>,
@@ -70,6 +71,7 @@ pub struct RecommendOptions {
     pub safety: SafetyLimits,
     pub port_start: u16,
     pub gpu_index: Option<u32>,
+    pub n_cpu_moe_values: Vec<u64>,
     pub near_full_ingest: bool,
     pub near_full_target_tokens: Option<u64>,
     pub agent: bool,
@@ -152,12 +154,18 @@ pub async fn run_tune(path: &Path, options: TuneOptions) -> Result<Recommendatio
     let requested_context = metadata.context_or(options.ctx_cap);
     let capabilities = ServerCapabilities::detect()?;
     let environment = capabilities.environment();
-    let all_candidates = generate_candidates_for_environment(
+    let mut all_candidates = generate_candidates_for_environment(
         &metadata,
         options.preset,
         requested_context,
         None,
         Some(&environment),
+    );
+    prepend_explicit_n_cpu_moe_candidates(
+        &mut all_candidates,
+        &metadata,
+        requested_context,
+        &options.n_cpu_moe_values,
     );
     if all_candidates.is_empty() {
         bail!("no candidates generated for {}", metadata.path.display());
@@ -277,6 +285,7 @@ pub async fn run_recommend(path: &Path, options: RecommendOptions) -> Result<Rec
             safety: options.safety.clone(),
             port_start: options.port_start,
             gpu_index: options.gpu_index,
+            n_cpu_moe_values: options.n_cpu_moe_values.clone(),
             plan_only: false,
             near_full_ingest: options.near_full_ingest,
             near_full_target_tokens: options.near_full_target_tokens,
@@ -363,6 +372,64 @@ fn promote_adaptive_candidates(
             queue.push_front(candidate);
         }
     }
+}
+
+fn prepend_explicit_n_cpu_moe_candidates(
+    candidates: &mut Vec<CandidateConfig>,
+    metadata: &GgufMetadata,
+    requested_context: u64,
+    values: &[u64],
+) {
+    if values.is_empty() || metadata.model_kind != crate::gguf::ModelKind::Moe {
+        return;
+    }
+
+    let mut explicit = Vec::new();
+    let mut seen = BTreeSet::new();
+    for value in values {
+        if let Some(expert_count) = metadata.expert_count
+            && *value > expert_count
+        {
+            continue;
+        }
+        if !seen.insert(*value) {
+            continue;
+        }
+        explicit.push(CandidateConfig {
+            id: format!("moe-q8_0-ncpumoe{value}-b16384-ub4096-explicit"),
+            requested_context,
+            batch: Some(16_384),
+            ubatch: Some(4_096),
+            kv_cache: Some("q8_0".to_string()),
+            fit_target: Some(1_536),
+            gpu_layers: None,
+            cpu_moe: false,
+            n_cpu_moe: Some(*value),
+            expected_risk: crate::profile::CandidateRisk::Medium,
+            note: "Explicit MoE expert-placement probe requested on the CLI".to_string(),
+            planning_note: "front-of-queue candidate from --n-cpu-moe-values".to_string(),
+        });
+    }
+    for candidate in explicit.into_iter().rev() {
+        if let Some(index) = candidates
+            .iter()
+            .position(|existing| same_candidate_shape(existing, &candidate))
+        {
+            candidates.remove(index);
+        }
+        candidates.insert(0, candidate);
+    }
+}
+
+fn same_candidate_shape(left: &CandidateConfig, right: &CandidateConfig) -> bool {
+    left.requested_context == right.requested_context
+        && left.batch == right.batch
+        && left.ubatch == right.ubatch
+        && left.kv_cache == right.kv_cache
+        && left.fit_target == right.fit_target
+        && left.gpu_layers == right.gpu_layers
+        && left.cpu_moe == right.cpu_moe
+        && left.n_cpu_moe == right.n_cpu_moe
 }
 
 fn same_candidate_family(left: &CandidateConfig, right: &CandidateConfig) -> bool {
@@ -1396,7 +1463,7 @@ pub fn parse_llama_timings(log_text: &str) -> TimingSummary {
     )
     .expect("valid prompt timing regex");
     let eval_re = Regex::new(
-        r"(?m)(?:^|:)\s*eval time\s*=\s*([0-9.]+)\s*ms\s*/\s*([0-9]+)\s*(?:runs?|tokens?).*?([0-9.]+)\s*tokens per second",
+        r"(?m)(?:^|:|\|)\s*eval time\s*=\s*([0-9.]+)\s*ms\s*/\s*([0-9]+)\s*(?:runs?|tokens?).*?([0-9.]+)\s*tokens per second",
     )
     .expect("valid eval timing regex");
 
@@ -1512,6 +1579,21 @@ llama_perf_context_print:        prompt eval time =   1000.00 ms / 16000 tokens 
     }
 
     #[test]
+    fn parses_llama_server_slot_timing_lines() {
+        let log = r#"
+0.04.579.842 I slot print_timing: id  0 | task 3 | prompt eval time =     204.20 ms /    25 tokens (    8.17 ms per token,   122.43 tokens per second)
+0.04.579.845 I slot print_timing: id  0 | task 3 |        eval time =    2120.60 ms /   128 tokens (   16.57 ms per token,    60.36 tokens per second)
+0.10.835.450 I slot print_timing: id  0 | task 133 | prompt eval time =    6188.84 ms / 14221 tokens (    0.44 ms per token,  2297.85 tokens per second)
+0.10.835.453 I slot print_timing: id  0 | task 133 |        eval time =       0.00 ms /     1 tokens (    0.00 ms per token, 1000000.00 tokens per second)
+"#;
+        let timing = parse_llama_timings(log);
+        assert_eq!(timing.prompt_evals.len(), 2);
+        assert_eq!(timing.evals.len(), 2);
+        assert_eq!(timing.best_prompt_toks_per_s(), Some(2297.85));
+        assert_eq!(timing.best_generation_toks_per_s(), Some(60.36));
+    }
+
+    #[test]
     fn drains_sse_data_lines() {
         let mut buffer = "data: {\"a\":1}\n\ndata: [DONE]\n".to_string();
         assert_eq!(
@@ -1546,6 +1628,52 @@ llama_perf_context_print:        prompt eval time =   1000.00 ms / 16000 tokens 
         assert_eq!(
             queue.front().map(|candidate| candidate.id.as_str()),
             Some(aggressive.id.as_str())
+        );
+    }
+
+    #[test]
+    fn explicit_n_cpu_moe_candidates_are_prepended() {
+        let metadata = GgufMetadata {
+            path: PathBuf::from("/models/test.gguf"),
+            file_name: "moe.gguf".to_string(),
+            file_size_bytes: 1,
+            gguf_version: 3,
+            tensor_count: 0,
+            metadata_kv_count: 0,
+            name: Some("test".to_string()),
+            architecture: Some("qwen35moe".to_string()),
+            size_label: None,
+            native_context: Some(262_144),
+            block_count: Some(1),
+            expert_count: Some(256),
+            expert_used_count: Some(8),
+            tokenizer_has_chat_template: true,
+            quant: Some("Q4_K_M".to_string()),
+            file_type: None,
+            model_kind: crate::gguf::ModelKind::Moe,
+            metadata: BTreeMap::new(),
+        };
+        let mut candidates = vec![test_candidate(
+            "moe-q8_0-ncpumoe31-b16384-ub4096",
+            16_384,
+            4_096,
+            1_536,
+        )];
+
+        prepend_explicit_n_cpu_moe_candidates(&mut candidates, &metadata, 262_144, &[32, 31, 30]);
+
+        let ids = candidates
+            .iter()
+            .take(3)
+            .map(|candidate| candidate.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec![
+                "moe-q8_0-ncpumoe32-b16384-ub4096-explicit",
+                "moe-q8_0-ncpumoe31-b16384-ub4096-explicit",
+                "moe-q8_0-ncpumoe30-b16384-ub4096-explicit"
+            ]
         );
     }
 
@@ -1606,6 +1734,7 @@ llama_perf_context_print:        prompt eval time =   1000.00 ms / 16000 tokens 
                 safety: SafetyLimits::default(),
                 port_start: 28_180,
                 gpu_index: None,
+                n_cpu_moe_values: Vec::new(),
                 plan_only: false,
                 near_full_ingest: false,
                 near_full_target_tokens: None,

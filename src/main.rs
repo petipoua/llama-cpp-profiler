@@ -73,6 +73,9 @@ struct TuneArgs {
     port_start: u16,
     #[arg(long)]
     gpu_index: Option<u32>,
+    /// Prepend explicit MoE --n-cpu-moe values, comma-separated, using q8_0 16k/4k candidates.
+    #[arg(long, value_delimiter = ',')]
+    n_cpu_moe_values: Vec<u64>,
     /// Add an opt-in near-full prompt-ingest probe just below the requested context.
     #[arg(long)]
     near_full_ingest: bool,
@@ -108,6 +111,9 @@ struct RecommendArgs {
     port_start: u16,
     #[arg(long)]
     gpu_index: Option<u32>,
+    /// Prepend explicit MoE --n-cpu-moe values, comma-separated, using q8_0 16k/4k candidates.
+    #[arg(long, value_delimiter = ',')]
+    n_cpu_moe_values: Vec<u64>,
     /// Add an opt-in near-full prompt-ingest probe just below the requested context.
     #[arg(long)]
     near_full_ingest: bool,
@@ -240,6 +246,7 @@ async fn main() -> Result<()> {
                     },
                     port_start: args.port_start,
                     gpu_index: args.gpu_index,
+                    n_cpu_moe_values: args.n_cpu_moe_values,
                     plan_only,
                     near_full_ingest: args.near_full_ingest,
                     near_full_target_tokens: args.near_full_target_tokens,
@@ -265,6 +272,7 @@ async fn main() -> Result<()> {
                     },
                     port_start: args.port_start,
                     gpu_index: args.gpu_index,
+                    n_cpu_moe_values: args.n_cpu_moe_values,
                     near_full_ingest: args.near_full_ingest,
                     near_full_target_tokens: args.near_full_target_tokens,
                     agent: args.agent,

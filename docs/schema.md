@@ -20,6 +20,8 @@ Important fields:
 - `command_display`: shell-escaped command string.
 - `candidate`: generated tuning config: context, batch, microbatch, KV cache type, fit target, GPU layer count, MoE placement flags, expected risk, note, and planning note.
 - `candidate.expected_risk`, `candidate.planning_note`: hardware-aware planning annotations.
+- Explicit MoE candidates requested with `--n-cpu-moe-values` are normal
+  candidates in artifacts and plans. Their ids end in `-explicit`.
 - `test_kind`: `tune` or `fullctx`.
 - `requested_context`: context passed to the server.
 - `validation_level`: serialized as `smoke`, `standard_ingest`, or `fullctx`; reports display `standard_ingest` as `standard-ingest`.

@@ -84,6 +84,17 @@ For an explicit near-full prompt-ingest check during tuning, opt in with
 266k context run targets roughly 250k estimated prompt tokens. Override it with
 `--near-full-target-tokens`.
 
+For MoE models where you already know the useful expert-placement boundary, put
+specific `--n-cpu-moe` values at the front of the plan:
+
+```bash
+llama-cpp-profiler tune ~/Models/<model-or-gguf> --preset quick --n-cpu-moe-values 32,31,30 --max-runs 3
+```
+
+Explicit MoE candidates use the common high-throughput shape
+`-ctk q8_0 -ctv q8_0 -b 16384 -ub 4096` and are still subject to the normal
+safety limits.
+
 Preview the hardware-aware candidate plan without starting servers. `--plan`
 prints JSON; `--json` is accepted only with `--plan` for compatibility with
 agent workflows.
@@ -140,8 +151,8 @@ selected, `export` prints the generated Markdown block.
 ```bash
 llama-cpp-profiler scan PATH [--no-tui]
 llama-cpp-profiler inspect PATH [--json]
-llama-cpp-profiler tune PATH [--ctx TOKENS] [--preset quick|standard|thorough] [--max-runs N] [--min-vram-free-mib MIB] [--max-swap-delta-mib MIB] [--port-start PORT] [--gpu-index INDEX] [--near-full-ingest] [--near-full-target-tokens TOKENS] [--plan] [--json]
-llama-cpp-profiler recommend PATH [--ctx TOKENS] [--preset quick|standard|thorough] [--max-runs N] [--profile ID] [--port PORT] [--min-vram-free-mib MIB] [--max-swap-delta-mib MIB] [--port-start PORT] [--gpu-index INDEX] [--near-full-ingest] [--near-full-target-tokens TOKENS] [--agent]
+llama-cpp-profiler tune PATH [--ctx TOKENS] [--preset quick|standard|thorough] [--max-runs N] [--min-vram-free-mib MIB] [--max-swap-delta-mib MIB] [--port-start PORT] [--gpu-index INDEX] [--n-cpu-moe-values VALUES] [--near-full-ingest] [--near-full-target-tokens TOKENS] [--plan] [--json]
+llama-cpp-profiler recommend PATH [--ctx TOKENS] [--preset quick|standard|thorough] [--max-runs N] [--profile ID] [--port PORT] [--min-vram-free-mib MIB] [--max-swap-delta-mib MIB] [--port-start PORT] [--gpu-index INDEX] [--n-cpu-moe-values VALUES] [--near-full-ingest] [--near-full-target-tokens TOKENS] [--agent]
 llama-cpp-profiler fullctx PATH [--profile ID] [--target-tokens TOKENS] [--ctx TOKENS] [--min-vram-free-mib MIB] [--max-swap-delta-mib MIB] [--port-start PORT] [--gpu-index INDEX]
 llama-cpp-profiler report PATH [--agent] [--include-stale]
 llama-cpp-profiler serve PATH [--profile ID] [--port PORT] [--print] [--allow-stale]
@@ -160,6 +171,8 @@ llama-cpp-profiler export PATH [--markdown] [--opencode PATH] [--dry-run] [--wri
 - `quick` runs at most 6 candidates; `standard` runs at most 16; `thorough` runs a broader sweep.
 - `quick` runs are labeled `smoke`; `standard` and `thorough` runs are labeled
   `standard-ingest`; `fullctx` runs are labeled `fullctx`.
+- `--n-cpu-moe-values` is a comma-separated MoE-only override that prepends
+  explicit partial-MoE candidates, for example `32,31,30`.
 - `fullctx` targets near-full prompts by default. `tune` and `recommend` can run
   one optional near-full ingest probe with `--near-full-ingest`.
 - Stale or legacy runs are excluded from best-profile selection by default.
