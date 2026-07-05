@@ -18,7 +18,9 @@ Install from this repository:
 cargo install --path .
 ```
 
-Discover local models and inspect one:
+Discover local models and inspect one. `inspect` accepts either a GGUF file or a
+directory containing GGUFs; when a directory is passed, the largest model GGUF is
+selected:
 
 ```bash
 llama-cpp-profiler scan ~/Models
@@ -40,8 +42,9 @@ Scan a model store:
 llama-cpp-profiler scan ~/Models
 ```
 
-On a TTY, `scan` opens a compact searchable picker. In non-interactive shells it
-prints a table. Files with `mmproj` or `draft` in the name are ignored.
+On a TTY, `scan` opens a compact searchable picker. In non-interactive shells,
+or with `--no-tui`, it prints a table. Files with `mmproj` or `draft` in the
+name are ignored.
 
 Inspect GGUF metadata:
 
@@ -62,7 +65,9 @@ llama-cpp-profiler tune ~/Models/<model-or-gguf> --ctx 262144 --preset standard
 runs sanity/output/ingest probes, writes raw artifacts, and stops the server after
 each candidate. It does not run a 250k-token prompt.
 
-Preview the hardware-aware candidate plan without starting servers:
+Preview the hardware-aware candidate plan without starting servers. `--plan`
+prints JSON; `--json` is accepted only with `--plan` for compatibility with
+agent workflows.
 
 ```bash
 llama-cpp-profiler tune ~/Models/<model-or-gguf> --ctx 262144 --preset quick --plan
@@ -105,7 +110,8 @@ llama-cpp-profiler export ~/Models --markdown --opencode ~/.config/opencode/open
 Markdown export updates only the managed block between
 `<!-- llama-cpp-profiler:start -->` and `<!-- llama-cpp-profiler:end -->` in
 `RUNNING_NOTES.md`. Opencode export is optional and only adds labels for a client
-that points at the running `llama-server` endpoint.
+that points at the running `llama-server` endpoint. If no export target is
+selected, `export` prints the generated Markdown block.
 
 ## Documentation
 
@@ -114,8 +120,8 @@ that points at the running `llama-server` endpoint.
 ```bash
 llama-cpp-profiler scan PATH [--no-tui]
 llama-cpp-profiler inspect PATH [--json]
-llama-cpp-profiler tune PATH [--ctx TOKENS] [--preset quick|standard|thorough] [--max-runs N] [--plan --json]
-llama-cpp-profiler fullctx PATH [--profile ID] [--target-tokens TOKENS]
+llama-cpp-profiler tune PATH [--ctx TOKENS] [--preset quick|standard|thorough] [--max-runs N] [--min-vram-free-mib MIB] [--max-swap-delta-mib MIB] [--port-start PORT] [--gpu-index INDEX] [--plan] [--json]
+llama-cpp-profiler fullctx PATH [--profile ID] [--target-tokens TOKENS] [--ctx TOKENS] [--min-vram-free-mib MIB] [--max-swap-delta-mib MIB] [--port-start PORT] [--gpu-index INDEX]
 llama-cpp-profiler report PATH [--agent] [--include-stale]
 llama-cpp-profiler serve PATH [--profile ID] [--port PORT] [--print] [--allow-stale]
 llama-cpp-profiler doctor [--json]
@@ -125,12 +131,17 @@ llama-cpp-profiler export PATH [--markdown] [--opencode PATH] [--dry-run] [--wri
 ### Defaults
 
 - Tune port range starts at `18180`; serve defaults to `18080`.
-- Default context cap is `262144`.
+- Default context cap is `262144`; the actual requested context is
+  `min(native_context, --ctx)` when GGUF metadata reports native context.
 - Safety defaults are `--min-vram-free-mib 512` and `--max-swap-delta-mib 1024`.
 - `quick` runs at most 6 candidates; `standard` runs at most 16; `thorough` runs a broader sweep.
+- `quick` runs are labeled `smoke`; `standard` and `thorough` runs are labeled
+  `standard-ingest`; `fullctx` runs are labeled `fullctx`.
 - `fullctx` is the only command that targets near-full prompts.
 - Stale or legacy runs are excluded from best-profile selection by default.
 - Export is dry-run unless `--write` is present.
+- `LLAMA_SERVER=/path/to/llama-server` overrides the executable used for
+  `tune`, `fullctx`, `serve`, and `doctor`.
 
 ### Artifacts
 
@@ -150,9 +161,11 @@ Each model directory gets:
   reports/latest.md
 ```
 
-`result.json` stores the exact command, GGUF metadata, probe summaries, parsed
-llama.cpp timing lines, client-observed TTFT, telemetry peaks/minimums, outcome,
-environment snapshot, validation level, and paths to raw artifacts.
+`request.json` and `response.json` each contain a `probes` array with all probe
+requests/responses for the run. `result.json` stores the exact command, GGUF
+metadata, probe summaries, parsed llama.cpp timing lines, client-observed TTFT,
+telemetry peaks/minimums, outcome, environment snapshot, validation level, and
+paths to raw artifacts.
 
 ### Profiles
 

@@ -22,7 +22,8 @@ Client harnesses such as opencode are not part of the core scoring model. They
 can be exported as labels that point at the server endpoint, but the running
 `llama-server` process determines the actual GGUF and runtime config.
 
-Recommendations are environment-bound. If the GPU, driver, CPU/RAM shape, or
+Recommendations are environment-bound. If the OS/architecture, CPU identity or
+core count, RAM/swap totals, GPU backend, GPU inventory/driver, or
 `llama-server` executable/help output changes, old runs are kept as stale
 evidence and excluded from best-profile selection.
 
@@ -40,8 +41,11 @@ VRAM headroom. Lower quant can improve output speed, but at long context the KV
 and compute-buffer fit often dominate.
 
 Candidate planning uses the current environment snapshot to keep likely-safe
-candidates ahead of aggressive ones. The sweep remains intentionally bounded;
-`tune --plan --json` exposes the ordered candidates without starting servers.
+candidates ahead of aggressive ones. The risk heuristic compares model size plus
+an approximate KV-cache footprint against total detected VRAM; if VRAM is not
+available, the conservative default order is preserved. The sweep remains
+intentionally bounded; `tune --plan` exposes the ordered candidates as JSON
+without starting servers.
 
 ## MoE Models
 
@@ -64,12 +68,18 @@ evidence: future agents should not retry the same aggressive settings blindly.
 - `output`: small prompt, 128 generated tokens.
 - `ingest`: repeated Apache-2.0 prompt around 16k tokens for `quick` and 64k for broader presets.
 
-`fullctx` is explicit opt-in and targets a near-full prompt, defaulting to about
-250k tokens. It exists for TTFT and stability checks, not for normal tuning.
+`quick` results are labeled with smoke validation even though the ingest probe is
+still run at the smaller 16k-token target. `standard` and `thorough` results are
+labeled `standard-ingest`.
 
-Prompt token counts prefer server timing lines in `server.log`. Prompt generation
-uses repeated local Apache-2.0 text so runs are deterministic and independent of
-network access.
+`fullctx` is explicit opt-in and sends only the near-full prompt probe,
+defaulting to about 250k target tokens and `max_tokens = 1`. It exists for TTFT
+and stability checks, not for normal tuning.
+
+Prompt token counts prefer server timing lines in `server.log`. Prompt
+generation uses `/usr/share/licenses/spdx/Apache-2.0.txt` when available, with a
+bundled Apache-2.0 fixture as fallback, so runs are deterministic and independent
+of network access.
 
 ## Scoring
 
@@ -81,8 +91,10 @@ Profiles are selected from runs that pass safety limits:
 - `balanced`: maximize harmonic mean of generation and prompt ingest speed.
 - `quality-night`: use quant tier only as a rough quality proxy, clearly labeled.
 
-Rejected runs keep their reason: OOM, timeout, server crash, too-tight VRAM,
-swap-thrashing, interrupted, or parse-partial.
+Rejected runs keep their reason: OOM, timeout, server crash, too-tight VRAM or
+swap use, interrupted, or parse-partial. `parse-partial` is still usable for
+recommendation scoring when it passes safety limits because the request
+completed but one or more llama.cpp timing lines were missing.
 
 Legacy or changed-environment runs are listed separately as stale. They are not
 used for scoring unless a future command explicitly opts into diagnostic display.

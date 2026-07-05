@@ -18,12 +18,12 @@ Important fields:
 - `gguf`: parsed GGUF metadata, including architecture, native context, quant, MoE expert counts, and chat-template presence.
 - `command`: argv array used to launch `llama-server`.
 - `command_display`: shell-escaped command string.
-- `candidate`: generated tuning config: context, batch, microbatch, KV cache type, fit target, and MoE placement flags.
+- `candidate`: generated tuning config: context, batch, microbatch, KV cache type, fit target, GPU layer count, MoE placement flags, expected risk, note, and planning note.
 - `candidate.expected_risk`, `candidate.planning_note`: hardware-aware planning annotations.
 - `test_kind`: `tune` or `fullctx`.
 - `requested_context`: context passed to the server.
-- `validation_level`: `smoke`, `standard_ingest`, or `fullctx`.
-- `environment`: profiler, OS, CPU, memory, GPU, and `llama-server` snapshot.
+- `validation_level`: serialized as `smoke`, `standard_ingest`, or `fullctx`; reports display `standard_ingest` as `standard-ingest`.
+- `environment`: profiler, OS/architecture, CPU, memory, GPU, and `llama-server` snapshot.
 - `compatibility`: `current`, `legacy_missing_snapshot`, `server_changed`, or `hardware_changed`.
 - `prompt_tokens`, `completion_tokens`: best available token counts, preferring server timing lines.
 - `metrics.server_prompt_eval_toks_per_s`: parsed from llama.cpp `prompt eval time`.
@@ -33,9 +33,9 @@ Important fields:
 - `metrics.peak_vram_mib`, `metrics.min_free_vram_mib`: sampled with `nvidia-smi`.
 - `metrics.gpu_util_avg_pct`, `metrics.gpu_util_max_pct`: sampled GPU utilization.
 - `metrics.ram_available_min_mib`, `metrics.swap_delta_mib`, `metrics.process_rss_peak_mib`, `metrics.cpu_util_avg_pct`: system/process telemetry.
-- `probes`: per-probe summaries for `sanity`, `output`, `ingest`, or `fullctx`.
+- `probes`: per-probe summaries for `sanity`, `output`, `ingest`, or `fullctx`. `tune` runs `sanity`, `output`, and `ingest`; `fullctx` runs `sanity` and `fullctx`.
 - `outcome`: `pass`, `oom`, `timeout`, `server_crash`, `too_tight`, `parse_partial`, or `interrupted`.
-- `artifacts`: paths to `command.sh`, `server.log`, `telemetry.jsonl`, `request.json`, `response.json`, and `result.json`.
+- `artifacts`: paths to `command.sh`, `server.log`, `telemetry.jsonl`, `request.json`, `response.json`, and `result.json`. `request.json` and `response.json` wrap all probe payloads in a `probes` array.
 - `note`: short human-readable note.
 
 ## `recommendations.json`
@@ -65,6 +65,11 @@ Each profile contains:
 - `peak_vram_mib`, `headroom_mib`
 - `risk`: `low`, `medium`, or `high`.
 - `note`
+
+Profile ids may point at the same source run when one candidate is best for
+multiple roles. Exact commands are stored as argv plus a shell-escaped display
+string; `serve --port` rewrites the saved `--port` value before running or
+printing the command.
 
 ## Reports
 
