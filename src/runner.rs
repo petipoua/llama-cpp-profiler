@@ -1495,6 +1495,7 @@ fn collect_recommendation_dirs(root: &Path, found: &mut Vec<PathBuf>) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
 
     #[test]
     fn parses_llama_cpp_timing_lines() {
@@ -1584,6 +1585,74 @@ llama_perf_context_print:        prompt eval time =   1000.00 ms / 16000 tokens 
         assert!(probe.summary.ttft_ms.is_some());
     }
 
+    #[tokio::test]
+    async fn e2e_tune_recommendations_and_serve_print_with_fake_server() {
+        let _guard = env_lock().lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let server_path = temp.path().join("fake-llama-server.py");
+        write_fake_llama_server(&server_path);
+        let model_path = temp.path().join("tiny.gguf");
+        write_test_gguf(&model_path, 8_192);
+
+        unsafe {
+            std::env::set_var("LLAMA_SERVER", &server_path);
+        }
+        let recs = run_tune(
+            &model_path,
+            TuneOptions {
+                ctx_cap: None,
+                preset: Preset::Quick,
+                max_runs: Some(1),
+                safety: SafetyLimits::default(),
+                port_start: 28_180,
+                gpu_index: None,
+                plan_only: false,
+                near_full_ingest: false,
+                near_full_target_tokens: None,
+            },
+        )
+        .await
+        .unwrap();
+        unsafe {
+            std::env::remove_var("LLAMA_SERVER");
+        }
+
+        assert!(
+            recs.profiles
+                .iter()
+                .any(|profile| profile.id == "interactive-fast")
+        );
+        let result_path = model_path
+            .parent()
+            .unwrap()
+            .join(".llama-cpp-profiler")
+            .join("runs")
+            .join(&recs.profiles[0].source_run_id)
+            .join("result.json");
+        let result: ProfileResult =
+            serde_json::from_str(&fs::read_to_string(result_path).unwrap()).unwrap();
+        assert_eq!(result.requested_context, 8_192);
+        assert_command_contains_context(&result.command, 8_192);
+
+        unsafe {
+            std::env::set_var("LLAMA_SERVER", &server_path);
+        }
+        run_serve(
+            &model_path,
+            ServeOptions {
+                profile: "interactive-fast".to_string(),
+                port: 28_080,
+                print_only: true,
+                allow_stale: false,
+            },
+        )
+        .await
+        .unwrap();
+        unsafe {
+            std::env::remove_var("LLAMA_SERVER");
+        }
+    }
+
     fn test_candidate(id: &str, batch: u64, ubatch: u64, fit_target: u64) -> CandidateConfig {
         CandidateConfig {
             id: id.to_string(),
@@ -1661,5 +1730,113 @@ llama_perf_context_print:        prompt eval time =   1000.00 ms / 16000 tokens 
             validation_level: ValidationLevel::Smoke,
             compatibility: crate::environment::Compatibility::Current,
         }
+    }
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn write_fake_llama_server(path: &Path) {
+        let script = r#"#!/usr/bin/env python3
+import argparse
+import signal
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+if "--help" in sys.argv:
+    print("--model -m --host --port -c --jinja -np --fit --fit-target -fa --reasoning -b -ub -ctk -ctv --cpu-moe --n-cpu-moe")
+    raise SystemExit(0)
+if "--version" in sys.argv:
+    print("fake llama-server 1")
+    raise SystemExit(0)
+
+parser = argparse.ArgumentParser(add_help=False)
+parser.add_argument("--port", type=int, default=18180)
+args, _ = parser.parse_known_args()
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        return
+
+    def do_GET(self):
+        if self.path in ("/health", "/v1/models"):
+            body = b"{\"ok\":true}"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def do_POST(self):
+        length = int(self.headers.get("content-length", "0"))
+        if length:
+            self.rfile.read(length)
+        body = b"data: {\"choices\":[{\"delta\":{\"content\":\"K\"}}]}\n\ndata: [DONE]\n\n"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        self.wfile.flush()
+        print("llama_perf_context_print:        prompt eval time =    100.00 ms /  4096 tokens (    0.02 ms per token, 40960.00 tokens per second)", file=sys.stderr, flush=True)
+        print("llama_perf_context_print:               eval time =    100.00 ms /   128 runs   (    0.78 ms per token, 1280.00 tokens per second)", file=sys.stderr, flush=True)
+
+server = HTTPServer(("127.0.0.1", args.port), Handler)
+signal.signal(signal.SIGTERM, lambda *_: server.shutdown())
+server.serve_forever()
+"#;
+        fs::write(path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).unwrap();
+        }
+    }
+
+    fn write_test_gguf(path: &Path, native_context: u32) {
+        use std::io::Write;
+        let mut file = fs::File::create(path).unwrap();
+        file.write_all(b"GGUF").unwrap();
+        file.write_all(&3u32.to_le_bytes()).unwrap();
+        file.write_all(&0u64.to_le_bytes()).unwrap();
+        file.write_all(&4u64.to_le_bytes()).unwrap();
+        write_gguf_string(&mut file, "general.architecture", "llama");
+        write_gguf_string(&mut file, "general.name", "Tiny Fake");
+        write_gguf_u32(&mut file, "general.file_type", 15);
+        write_gguf_u32(&mut file, "llama.context_length", native_context);
+    }
+
+    fn write_gguf_key(file: &mut fs::File, key: &str, kind: u32) {
+        use std::io::Write;
+        file.write_all(&(key.len() as u64).to_le_bytes()).unwrap();
+        file.write_all(key.as_bytes()).unwrap();
+        file.write_all(&kind.to_le_bytes()).unwrap();
+    }
+
+    fn write_gguf_string(file: &mut fs::File, key: &str, value: &str) {
+        use std::io::Write;
+        write_gguf_key(file, key, 8);
+        file.write_all(&(value.len() as u64).to_le_bytes()).unwrap();
+        file.write_all(value.as_bytes()).unwrap();
+    }
+
+    fn write_gguf_u32(file: &mut fs::File, key: &str, value: u32) {
+        use std::io::Write;
+        write_gguf_key(file, key, 4);
+        file.write_all(&value.to_le_bytes()).unwrap();
+    }
+
+    fn assert_command_contains_context(command: &[String], context: u64) {
+        let index = command
+            .iter()
+            .position(|part| part == "-c")
+            .expect("command contains -c");
+        assert_eq!(command[index + 1], context.to_string());
     }
 }
