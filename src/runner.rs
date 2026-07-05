@@ -367,10 +367,10 @@ fn promote_adaptive_candidates(
 
 fn same_candidate_family(left: &CandidateConfig, right: &CandidateConfig) -> bool {
     left.id.split('-').next() == right.id.split('-').next()
-        && left.requested_context == right.requested_context
 }
 
 fn candidate_aggressiveness(candidate: &CandidateConfig) -> i64 {
+    let context = candidate.requested_context as i64 / 4096;
     let batch = candidate.batch.unwrap_or(0) as i64 / 1024;
     let ubatch = candidate.ubatch.unwrap_or(0) as i64 / 512;
     let fit = candidate
@@ -389,7 +389,7 @@ fn candidate_aggressiveness(candidate: &CandidateConfig) -> i64 {
             .map(|value| 64_i64.saturating_sub(value as i64))
             .unwrap_or(0)
     };
-    batch + ubatch + fit + kv + moe
+    context + batch + ubatch + fit + kv + moe
 }
 
 pub async fn run_fullctx(path: &Path, options: FullCtxOptions) -> Result<ProfileResult> {

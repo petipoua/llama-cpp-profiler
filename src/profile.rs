@@ -273,18 +273,21 @@ pub fn generate_candidates(
 
 pub fn generate_candidates_for_environment(
     metadata: &GgufMetadata,
-    preset: Preset,
+    _preset: Preset,
     requested_context: u64,
     max_runs: Option<usize>,
     environment: Option<&EnvironmentSnapshot>,
 ) -> Vec<CandidateConfig> {
-    let cap = max_runs.unwrap_or_else(|| preset.max_candidates());
+    let cap = max_runs;
     let mut candidates = match metadata.model_kind {
         ModelKind::Moe => moe_candidates(metadata, requested_context),
         ModelKind::Dense | ModelKind::Unknown => dense_candidates(requested_context),
     };
+    add_context_fallback_candidates(&mut candidates, requested_context);
     annotate_and_order_candidates(&mut candidates, metadata, environment);
-    candidates.truncate(cap);
+    if let Some(cap) = cap {
+        candidates.truncate(cap);
+    }
     candidates
 }
 
@@ -624,11 +627,58 @@ fn annotate_and_order_candidates(
             }
         };
     }
-    candidates.sort_by_key(|candidate| match candidate.expected_risk {
-        CandidateRisk::Low => 0,
-        CandidateRisk::Medium => 1,
-        CandidateRisk::High => 2,
+    let native_context = candidates
+        .iter()
+        .map(|candidate| candidate.requested_context)
+        .max()
+        .unwrap_or(0);
+    candidates.sort_by_key(|candidate| {
+        let context_rank = u8::from(candidate.requested_context < native_context);
+        let risk_rank = match candidate.expected_risk {
+            CandidateRisk::Low => 0,
+            CandidateRisk::Medium => 1,
+            CandidateRisk::High => 2,
+        };
+        (context_rank, risk_rank)
     });
+}
+
+fn add_context_fallback_candidates(candidates: &mut Vec<CandidateConfig>, requested_context: u64) {
+    let fallback_contexts = fallback_contexts(requested_context);
+    if fallback_contexts.is_empty() {
+        return;
+    }
+    let templates = candidates
+        .iter()
+        .take(4)
+        .cloned()
+        .collect::<Vec<CandidateConfig>>();
+    for context in fallback_contexts {
+        for template in &templates {
+            let mut candidate = template.clone();
+            candidate.requested_context = context;
+            candidate.id = format!("{}-ctx{context}", candidate.id);
+            candidate.expected_risk = CandidateRisk::Low;
+            candidate.planning_note = format!(
+                "fallback below native/requested context after higher-context candidates fail or run too tight"
+            );
+            candidates.push(candidate);
+        }
+    }
+}
+
+fn fallback_contexts(requested_context: u64) -> Vec<u64> {
+    let mut contexts = Vec::new();
+    for context in [
+        requested_context / 2,
+        requested_context / 4,
+        requested_context.min(65_536),
+    ] {
+        if context >= 4_096 && context < requested_context && !contexts.contains(&context) {
+            contexts.push(context);
+        }
+    }
+    contexts
 }
 
 fn candidate_risk(
@@ -861,6 +911,24 @@ mod tests {
             candidates
                 .iter()
                 .any(|candidate| candidate.n_cpu_moe == Some(16))
+        );
+    }
+
+    #[test]
+    fn candidates_start_at_requested_context_and_keep_lower_fallbacks() {
+        let metadata = fake_metadata(Some("Q4_K_M"));
+        let candidates = generate_candidates(&metadata, Preset::Quick, 262_144, None);
+
+        assert_eq!(candidates.first().unwrap().requested_context, 262_144);
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.requested_context == 131_072)
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.requested_context == 65_536)
         );
     }
 
