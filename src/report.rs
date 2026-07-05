@@ -14,6 +14,7 @@ const MANAGED_END: &str = "<!-- llama-cpp-profiler:end -->";
 #[derive(Debug, Clone)]
 pub struct ReportOptions {
     pub agent: bool,
+    pub include_stale: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -26,10 +27,12 @@ pub struct ExportOptions {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AgentReport {
+    schema_version: u32,
     best_profile_ids: Vec<String>,
     exact_command: Option<String>,
     key_metrics: Vec<AgentMetric>,
     failures: Vec<String>,
+    stale_profiles: Vec<String>,
     next_suggested_test: Option<String>,
 }
 
@@ -37,11 +40,19 @@ struct AgentReport {
 struct AgentMetric {
     model_path: PathBuf,
     profile_id: String,
+    source_run_id: String,
+    source_candidate_id: String,
+    source_test_kind: String,
+    requested_context: u64,
+    validated_prompt_tokens: Option<u64>,
+    validation_level: crate::profile::ValidationLevel,
     output_toks_per_s: Option<f64>,
     prompt_toks_per_s: Option<f64>,
     ttft_ms: Option<u64>,
     headroom_mib: Option<u64>,
     risk: String,
+    compatibility: crate::environment::Compatibility,
+    exact_command: String,
 }
 
 pub fn print_report(root: &Path, options: ReportOptions) -> Result<()> {
@@ -60,6 +71,23 @@ pub fn print_report(root: &Path, options: ReportOptions) -> Result<()> {
     for (metadata, recs) in &profiled {
         for profile in &recs.profiles {
             table.add_row(profile_row(metadata, profile));
+        }
+        if options.include_stale {
+            for stale in &recs.stale {
+                table.add_row(vec![
+                    Cell::new(&metadata.file_name),
+                    Cell::new(format!("stale:{}", stale.candidate_id)),
+                    Cell::new(stale.reason.clone()),
+                    Cell::new("-"),
+                    Cell::new("-"),
+                    Cell::new("-"),
+                    Cell::new("-"),
+                    Cell::new("-"),
+                    Cell::new(format!("{:?}", stale.compatibility).to_ascii_lowercase()),
+                    Cell::new("stale"),
+                    Cell::new("-"),
+                ]);
+            }
         }
     }
     println!("{table}");
@@ -239,6 +267,7 @@ pub fn markdown_for_recommendations(recommendations: &RecommendationFile) -> Str
                 profile.peak_vram_mib,
                 profile.headroom_mib,
                 profile.risk.as_str(),
+                validation_label(profile.validation_level),
                 profile.command_display.as_str(),
             )
         }),
@@ -254,6 +283,17 @@ pub fn markdown_for_recommendations(recommendations: &RecommendationFile) -> Str
             ));
         }
     }
+    if !recommendations.stale.is_empty() {
+        lines.push(String::new());
+        lines.push("## Stale".to_string());
+        lines.push(String::new());
+        for stale in &recommendations.stale {
+            lines.push(format!(
+                "- `{}` / `{}`: {:?} - {}",
+                stale.run_id, stale.candidate_id, stale.compatibility, stale.reason
+            ));
+        }
+    }
     if let Some(next) = &recommendations.next_suggested_test {
         lines.push(String::new());
         lines.push(format!("Next suggested test: {next}"));
@@ -265,6 +305,7 @@ pub fn markdown_for_recommendations(recommendations: &RecommendationFile) -> Str
 fn print_agent_report(profiled: &[(GgufMetadata, RecommendationFile)]) -> Result<()> {
     let mut all_profiles = Vec::new();
     let mut failures = Vec::new();
+    let mut stale_profiles = Vec::new();
     let mut next = None;
     for (metadata, recs) in profiled {
         if next.is_none() {
@@ -274,6 +315,12 @@ fn print_agent_report(profiled: &[(GgufMetadata, RecommendationFile)]) -> Result
             failures.push(format!(
                 "{} {} {:?}: {}",
                 metadata.file_name, rejected.candidate_id, rejected.outcome, rejected.reason
+            ));
+        }
+        for stale in &recs.stale {
+            stale_profiles.push(format!(
+                "{} {} {:?}: {}",
+                metadata.file_name, stale.candidate_id, stale.compatibility, stale.reason
             ));
         }
         for profile in &recs.profiles {
@@ -302,18 +349,28 @@ fn print_agent_report(profiled: &[(GgufMetadata, RecommendationFile)]) -> Result
         .map(|(metadata, profile)| AgentMetric {
             model_path: metadata.path.clone(),
             profile_id: profile.id.clone(),
+            source_run_id: profile.source_run_id.clone(),
+            source_candidate_id: profile.source_candidate_id.clone(),
+            source_test_kind: profile.source_test_kind.clone(),
+            requested_context: profile.requested_context,
+            validated_prompt_tokens: profile.validated_prompt_tokens,
+            validation_level: profile.validation_level,
             output_toks_per_s: profile.output_toks_per_s,
             prompt_toks_per_s: profile.prompt_toks_per_s,
             ttft_ms: profile.ttft_ms,
             headroom_mib: profile.headroom_mib,
             risk: profile.risk.clone(),
+            compatibility: profile.compatibility,
+            exact_command: profile.command_display.clone(),
         })
         .collect();
     let report = AgentReport {
+        schema_version: crate::profile::SCHEMA_VERSION,
         best_profile_ids,
         exact_command,
         key_metrics,
         failures: failures.into_iter().take(12).collect(),
+        stale_profiles: stale_profiles.into_iter().take(12).collect(),
         next_suggested_test: next,
     };
     println!("{}", serde_json::to_string(&report)?);
@@ -376,6 +433,7 @@ fn markdown_block(profiled: &[(GgufMetadata, RecommendationFile)]) -> String {
                 profile.peak_vram_mib,
                 profile.headroom_mib,
                 profile.risk.as_str(),
+                validation_label(profile.validation_level),
                 profile.command_display.as_str(),
                 metadata.file_name.as_str(),
             ));
@@ -392,13 +450,13 @@ fn markdown_block(profiled: &[(GgufMetadata, RecommendationFile)]) -> String {
     let mut lines = vec![
         "## llama.cpp profiler".to_string(),
         String::new(),
-        "| Model | Profile | Role | Output tok/s | Prompt tok/s | TTFT | Peak VRAM | Headroom | Risk | Command |".to_string(),
-        "|---|---|---|---:|---:|---:|---:|---:|---|---|".to_string(),
+        "| Model | Profile | Role | Output tok/s | Prompt tok/s | TTFT | Peak VRAM | Headroom | Risk | Validation | Command |".to_string(),
+        "|---|---|---|---:|---:|---:|---:|---:|---|---|---|".to_string(),
     ];
     for row in rows {
         lines.push(format!(
-            "| `{}` | `{}` | {} | {} | {} | {} | {} | {} | {} | `{}` |",
-            row.9,
+            "| `{}` | `{}` | {} | {} | {} | {} | {} | {} | {} | {} | `{}` |",
+            row.10,
             row.0,
             escape_md(row.1),
             fmt_f64(row.2),
@@ -407,7 +465,8 @@ fn markdown_block(profiled: &[(GgufMetadata, RecommendationFile)]) -> String {
             fmt_mib(row.5),
             fmt_mib(row.6),
             row.7,
-            row.8.replace('|', "\\|"),
+            row.8,
+            row.9.replace('|', "\\|"),
         ));
     }
     lines.join("\n")
@@ -425,15 +484,16 @@ fn comparison_markdown_table<'a>(
             Option<u64>,
             &'a str,
             &'a str,
+            &'a str,
         ),
     >,
 ) -> String {
     let mut lines = Vec::new();
-    lines.push("| Profile | Role | Output tok/s | Prompt tok/s | TTFT | Peak VRAM | Headroom | Risk | Command |".to_string());
-    lines.push("|---|---|---:|---:|---:|---:|---:|---|---|".to_string());
-    for (id, role, output, prompt, ttft, peak, headroom, risk, command) in rows {
+    lines.push("| Profile | Role | Output tok/s | Prompt tok/s | TTFT | Peak VRAM | Headroom | Risk | Validation | Command |".to_string());
+    lines.push("|---|---|---:|---:|---:|---:|---:|---|---|---|".to_string());
+    for (id, role, output, prompt, ttft, peak, headroom, risk, validation, command) in rows {
         lines.push(format!(
-            "| `{}` | {} | {} | {} | {} | {} | {} | {} | `{}` |",
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | `{}` |",
             id,
             escape_md(role),
             fmt_f64(output),
@@ -442,6 +502,7 @@ fn comparison_markdown_table<'a>(
             fmt_mib(peak),
             fmt_mib(headroom),
             risk,
+            validation,
             command.replace('|', "\\|"),
         ));
     }
@@ -461,6 +522,7 @@ fn comparison_table() -> Table {
         "Peak VRAM",
         "Headroom",
         "Risk",
+        "Validation",
         "Command",
     ]);
     table
@@ -477,8 +539,17 @@ fn profile_row(metadata: &GgufMetadata, profile: &Recommendation) -> Vec<Cell> {
         Cell::new(fmt_mib(profile.peak_vram_mib)),
         Cell::new(fmt_mib(profile.headroom_mib)),
         Cell::new(&profile.risk),
+        Cell::new(validation_label(profile.validation_level)),
         Cell::new(&profile.command_display),
     ]
+}
+
+fn validation_label(value: crate::profile::ValidationLevel) -> &'static str {
+    match value {
+        crate::profile::ValidationLevel::Smoke => "smoke",
+        crate::profile::ValidationLevel::StandardIngest => "standard-ingest",
+        crate::profile::ValidationLevel::Fullctx => "fullctx",
+    }
 }
 
 fn fmt_f64(value: Option<f64>) -> String {
