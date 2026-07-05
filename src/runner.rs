@@ -2,8 +2,9 @@ use crate::environment::{EnvironmentSnapshot, capture_environment, compare_envir
 use crate::gguf::{GgufMetadata, read_metadata, resolve_model_path};
 use crate::profile::{
     ArtifactPaths, CandidateConfig, Manifest, Outcome, Preset, ProbeSummary, ProfileResult,
-    RecommendationFile, SCHEMA_VERSION, SafetyLimits, ValidationLevel, build_recommendations,
-    command_display, generate_candidates, generate_candidates_for_environment,
+    Recommendation, RecommendationFile, SCHEMA_VERSION, SafetyLimits, ValidationLevel,
+    build_recommendations, command_display, generate_candidates,
+    generate_candidates_for_environment,
 };
 use crate::report;
 use crate::telemetry::TelemetrySampler;
@@ -37,6 +38,8 @@ pub struct TuneOptions {
     pub port_start: u16,
     pub gpu_index: Option<u32>,
     pub plan_only: bool,
+    pub near_full_ingest: bool,
+    pub near_full_target_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +58,37 @@ pub struct ServeOptions {
     pub port: u16,
     pub print_only: bool,
     pub allow_stale: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecommendOptions {
+    pub ctx_cap: Option<u64>,
+    pub preset: Preset,
+    pub max_runs: Option<usize>,
+    pub profile: String,
+    pub port: u16,
+    pub safety: SafetyLimits,
+    pub port_start: u16,
+    pub gpu_index: Option<u32>,
+    pub near_full_ingest: bool,
+    pub near_full_target_tokens: Option<u64>,
+    pub agent: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecommendOutput {
+    pub model_path: PathBuf,
+    pub profile_id: String,
+    pub profile_key: String,
+    pub confidence: String,
+    pub command: String,
+    pub output_toks_per_s: Option<f64>,
+    pub prompt_toks_per_s: Option<f64>,
+    pub ttft_ms: Option<u64>,
+    pub requested_context: u64,
+    pub validated_prompt_tokens: Option<u64>,
+    pub validation_level: ValidationLevel,
+    pub next_suggested_test: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -221,6 +255,52 @@ pub async fn run_tune(path: &Path, options: TuneOptions) -> Result<Recommendatio
     )?;
     report::write_latest_markdown(&metadata.profiler_dir(), &recommendations)?;
     Ok(recommendations)
+}
+
+pub async fn run_recommend(path: &Path, options: RecommendOptions) -> Result<RecommendOutput> {
+    let recs = run_tune(
+        path,
+        TuneOptions {
+            ctx_cap: options.ctx_cap,
+            preset: options.preset,
+            max_runs: options.max_runs,
+            safety: options.safety.clone(),
+            port_start: options.port_start,
+            gpu_index: options.gpu_index,
+            plan_only: false,
+            near_full_ingest: options.near_full_ingest,
+            near_full_target_tokens: options.near_full_target_tokens,
+        },
+    )
+    .await?;
+    let model_path = recs.model_path.clone();
+    let profile = recs
+        .profiles
+        .iter()
+        .find(|profile| profile.id == options.profile)
+        .or_else(|| recs.profiles.first())
+        .with_context(|| {
+            format!(
+                "no usable profiles were produced for {}",
+                model_path.display()
+            )
+        })?;
+    let command = command_display(&command_with_port(&profile.command, options.port));
+    if !options.agent {
+        eprintln!(
+            "selected {} from {}; output {:?} tok/s, prompt {:?} tok/s",
+            profile.id,
+            profile.source_candidate_id,
+            profile.output_toks_per_s,
+            profile.prompt_toks_per_s
+        );
+    }
+    Ok(recommend_output(
+        &model_path,
+        profile,
+        command,
+        recs.next_suggested_test.clone(),
+    ))
 }
 
 fn promote_adaptive_candidates(
@@ -413,6 +493,41 @@ pub async fn run_serve(path: &Path, options: ServeOptions) -> Result<()> {
         bail!("serve command exited with {status}");
     }
     Ok(())
+}
+
+fn recommend_output(
+    model_path: &Path,
+    profile: &Recommendation,
+    command: String,
+    next_suggested_test: Option<String>,
+) -> RecommendOutput {
+    RecommendOutput {
+        model_path: model_path.to_path_buf(),
+        profile_id: profile.id.clone(),
+        profile_key: profile_key(model_path, profile),
+        confidence: confidence_label(profile).to_string(),
+        command,
+        output_toks_per_s: profile.output_toks_per_s,
+        prompt_toks_per_s: profile.prompt_toks_per_s,
+        ttft_ms: profile.ttft_ms,
+        requested_context: profile.requested_context,
+        validated_prompt_tokens: profile.validated_prompt_tokens,
+        validation_level: profile.validation_level,
+        next_suggested_test,
+    }
+}
+
+pub fn profile_key(model_path: &Path, profile: &Recommendation) -> String {
+    format!("{}#{}", model_path.display(), profile.id)
+}
+
+fn confidence_label(profile: &Recommendation) -> &'static str {
+    match (profile.validation_level, profile.risk.as_str()) {
+        (ValidationLevel::Fullctx, "low" | "medium") => "high",
+        (ValidationLevel::StandardIngest, "low" | "medium") => "medium",
+        (ValidationLevel::Smoke, "low" | "medium") => "low",
+        _ => "low",
+    }
 }
 
 fn capture_current_environment_best_effort() -> EnvironmentSnapshot {

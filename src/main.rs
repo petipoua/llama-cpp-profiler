@@ -4,7 +4,9 @@ use llama_cpp_profiler::environment::capture_environment;
 use llama_cpp_profiler::gguf;
 use llama_cpp_profiler::profile::{Preset, SafetyLimits};
 use llama_cpp_profiler::report::{self, ExportOptions, ReportOptions};
-use llama_cpp_profiler::runner::{self, FullCtxOptions, ServeOptions, TuneOptions};
+use llama_cpp_profiler::runner::{
+    self, FullCtxOptions, RecommendOptions, ServeOptions, TuneOptions,
+};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -25,6 +27,8 @@ enum Commands {
     Inspect(InspectArgs),
     /// Run bounded llama-server tuning probes.
     Tune(TuneArgs),
+    /// Run tuning, then print the recommended server command.
+    Recommend(RecommendArgs),
     /// Run an explicit near-full-context TTFT and stability probe.
     Fullctx(FullCtxArgs),
     /// Print ranked profiler summaries.
@@ -69,12 +73,50 @@ struct TuneArgs {
     port_start: u16,
     #[arg(long)]
     gpu_index: Option<u32>,
+    /// Add an opt-in near-full prompt-ingest probe just below the requested context.
+    #[arg(long)]
+    near_full_ingest: bool,
+    /// Override the near-full ingest target token estimate.
+    #[arg(long)]
+    near_full_target_tokens: Option<u64>,
     /// Print the candidate plan as JSON and do not start llama-server.
     #[arg(long)]
     plan: bool,
     /// Use JSON output with --plan.
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Debug, Args)]
+struct RecommendArgs {
+    path: PathBuf,
+    #[arg(long, default_value_t = 262_144)]
+    ctx: u64,
+    #[arg(long, default_value = "standard")]
+    preset: Preset,
+    #[arg(long)]
+    max_runs: Option<usize>,
+    #[arg(long, default_value = "interactive-fast")]
+    profile: String,
+    #[arg(long, default_value_t = 18_080)]
+    port: u16,
+    #[arg(long, default_value_t = 512)]
+    min_vram_free_mib: u64,
+    #[arg(long, default_value_t = 1024)]
+    max_swap_delta_mib: u64,
+    #[arg(long, default_value_t = 18_180)]
+    port_start: u16,
+    #[arg(long)]
+    gpu_index: Option<u32>,
+    /// Add an opt-in near-full prompt-ingest probe just below the requested context.
+    #[arg(long)]
+    near_full_ingest: bool,
+    /// Override the near-full ingest target token estimate.
+    #[arg(long)]
+    near_full_target_tokens: Option<u64>,
+    /// Emit compact JSON for agents instead of human text.
+    #[arg(long)]
+    agent: bool,
 }
 
 #[derive(Debug, Args)]
@@ -199,11 +241,45 @@ async fn main() -> Result<()> {
                     port_start: args.port_start,
                     gpu_index: args.gpu_index,
                     plan_only,
+                    near_full_ingest: args.near_full_ingest,
+                    near_full_target_tokens: args.near_full_target_tokens,
                 },
             )
             .await?;
             if !plan_only {
                 println!("{}", report::markdown_for_recommendations(&recs));
+            }
+        }
+        Commands::Recommend(args) => {
+            let recommendation = runner::run_recommend(
+                &args.path,
+                RecommendOptions {
+                    ctx_cap: Some(args.ctx),
+                    preset: args.preset,
+                    max_runs: args.max_runs,
+                    profile: args.profile,
+                    port: args.port,
+                    safety: SafetyLimits {
+                        min_vram_free_mib: args.min_vram_free_mib,
+                        max_swap_delta_mib: args.max_swap_delta_mib,
+                    },
+                    port_start: args.port_start,
+                    gpu_index: args.gpu_index,
+                    near_full_ingest: args.near_full_ingest,
+                    near_full_target_tokens: args.near_full_target_tokens,
+                    agent: args.agent,
+                },
+            )
+            .await?;
+            if args.agent {
+                println!("{}", serde_json::to_string(&recommendation)?);
+            } else {
+                println!("profile: {}", recommendation.profile_id);
+                println!("confidence: {}", recommendation.confidence);
+                println!("command: {}", recommendation.command);
+                if let Some(next) = recommendation.next_suggested_test {
+                    println!("next: {next}");
+                }
             }
         }
         Commands::Fullctx(args) => {
