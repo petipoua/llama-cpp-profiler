@@ -75,6 +75,12 @@ each candidate. It can promote safer or more aggressive already-planned
 candidates from observed results, but stays within the selected preset or
 `--max-runs` budget. It does not run a 250k-token prompt.
 
+For local Qwen probing, generated server commands and chat probes use the same
+high-thinking precise baseline as `llama-run`: `--reasoning on`,
+`--reasoning-budget 4096`, `--chat-template-kwargs '{"enable_thinking":true}'`,
+`--temp 0.6`, `--top-p 0.95`, `--top-k 20`, `--min-p 0.0`,
+`--presence-penalty 0.0`, and `--repeat-penalty 1.0`.
+
 By default, tuning starts at the model's native context length when GGUF metadata
 reports it, capped by `--ctx`. Lower-context fallback candidates are kept in the
 plan and can be promoted after OOM, timeout, crash, or too-tight runs.

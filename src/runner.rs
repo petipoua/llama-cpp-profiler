@@ -28,6 +28,7 @@ use tokio::process::{Child, Command};
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(180);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 const TELEMETRY_INTERVAL: Duration = Duration::from_millis(500);
+const THINKING_BUDGET_MESSAGE: &str = "I should stop thinking and answer now.";
 
 #[derive(Debug, Clone)]
 pub struct TuneOptions {
@@ -918,7 +919,13 @@ pub async fn post_chat_completion(
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
-        "temperature": 0.0,
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+        "chat_template_kwargs": {"enable_thinking": true},
         "stream": true
     });
     let started = Instant::now();
@@ -1163,7 +1170,40 @@ fn build_command(
         args.extend(["-fa".to_string(), "on".to_string()]);
     }
     if capabilities.supports("--reasoning") {
-        args.extend(["--reasoning".to_string(), "off".to_string()]);
+        args.extend(["--reasoning".to_string(), "on".to_string()]);
+    }
+    if capabilities.supports("--reasoning-budget") {
+        args.extend(["--reasoning-budget".to_string(), "4096".to_string()]);
+    }
+    if capabilities.supports("--chat-template-kwargs") {
+        args.extend([
+            "--chat-template-kwargs".to_string(),
+            "{\"enable_thinking\":true}".to_string(),
+        ]);
+    }
+    if capabilities.supports("--temp") {
+        args.extend(["--temp".to_string(), "0.6".to_string()]);
+    }
+    if capabilities.supports("--top-p") {
+        args.extend(["--top-p".to_string(), "0.95".to_string()]);
+    }
+    if capabilities.supports("--top-k") {
+        args.extend(["--top-k".to_string(), "20".to_string()]);
+    }
+    if capabilities.supports("--min-p") {
+        args.extend(["--min-p".to_string(), "0.0".to_string()]);
+    }
+    if capabilities.supports("--presence-penalty") {
+        args.extend(["--presence-penalty".to_string(), "0.0".to_string()]);
+    }
+    if capabilities.supports("--repeat-penalty") {
+        args.extend(["--repeat-penalty".to_string(), "1.0".to_string()]);
+    }
+    if capabilities.supports("--reasoning-budget-message") {
+        args.extend([
+            "--reasoning-budget-message".to_string(),
+            THINKING_BUDGET_MESSAGE.to_string(),
+        ]);
     }
     if let Some(batch) = candidate.batch
         && capabilities.supports("-b")
@@ -1762,6 +1802,7 @@ llama_perf_context_print:        prompt eval time =   1000.00 ms / 16000 tokens 
             serde_json::from_str(&fs::read_to_string(result_path).unwrap()).unwrap();
         assert_eq!(result.requested_context, 8_192);
         assert_command_contains_context(&result.command, 8_192);
+        assert_command_contains_high_thinking_defaults(&result.command);
 
         unsafe {
             std::env::set_var("LLAMA_SERVER", &server_path);
@@ -1874,7 +1915,7 @@ import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 if "--help" in sys.argv:
-    print("--model -m --host --port -c --jinja -np --fit --fit-target -fa --reasoning -b -ub -ctk -ctv --cpu-moe --n-cpu-moe")
+    print("--model -m --host --port -c --jinja -np --fit --fit-target -fa --reasoning --reasoning-budget --reasoning-budget-message --chat-template-kwargs --temp --top-p --top-k --min-p --presence-penalty --repeat-penalty -b -ub -ctk -ctv --cpu-moe --n-cpu-moe")
     raise SystemExit(0)
 if "--version" in sys.argv:
     print("fake llama-server 1")
@@ -1967,5 +2008,25 @@ server.serve_forever()
             .position(|part| part == "-c")
             .expect("command contains -c");
         assert_eq!(command[index + 1], context.to_string());
+    }
+
+    fn assert_command_contains_high_thinking_defaults(command: &[String]) {
+        for (flag, value) in [
+            ("--reasoning", "on"),
+            ("--reasoning-budget", "4096"),
+            ("--chat-template-kwargs", "{\"enable_thinking\":true}"),
+            ("--temp", "0.6"),
+            ("--top-p", "0.95"),
+            ("--top-k", "20"),
+            ("--min-p", "0.0"),
+            ("--presence-penalty", "0.0"),
+            ("--repeat-penalty", "1.0"),
+            ("--reasoning-budget-message", THINKING_BUDGET_MESSAGE),
+        ] {
+            let has_pair = command
+                .windows(2)
+                .any(|window| window[0] == flag && window[1] == value);
+            assert!(has_pair, "command missing {flag} {value}: {command:?}");
+        }
     }
 }
