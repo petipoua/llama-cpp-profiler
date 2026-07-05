@@ -33,7 +33,10 @@ Important fields:
 - `metrics.peak_vram_mib`, `metrics.min_free_vram_mib`: sampled with `nvidia-smi`.
 - `metrics.gpu_util_avg_pct`, `metrics.gpu_util_max_pct`: sampled GPU utilization.
 - `metrics.ram_available_min_mib`, `metrics.swap_delta_mib`, `metrics.process_rss_peak_mib`, `metrics.cpu_util_avg_pct`: system/process telemetry.
-- `probes`: per-probe summaries for `sanity`, `output`, `ingest`, or `fullctx`. `tune` runs `sanity`, `output`, and `ingest`; `fullctx` runs `sanity` and `fullctx`.
+- `probes`: per-probe summaries for `sanity`, `output`, `ingest`,
+  `near_full_ingest`, or `fullctx`. `tune` runs `sanity`, `output`, and
+  `ingest`; `tune --near-full-ingest` and `recommend --near-full-ingest` also
+  run `near_full_ingest`; `fullctx` runs `sanity` and `fullctx`.
 - `outcome`: `pass`, `oom`, `timeout`, `server_crash`, `too_tight`, `parse_partial`, or `interrupted`.
 - `artifacts`: paths to `command.sh`, `server.log`, `telemetry.jsonl`, `request.json`, `response.json`, and `result.json`. `request.json` and `response.json` wrap all probe payloads in a `probes` array.
 - `note`: short human-readable note.
@@ -80,7 +83,7 @@ Markdown reports put the comparison table first:
 
 `report --agent` prints one compact JSON object:
 
-- `best_profile_ids`
+- `best_profile_ids`: unambiguous `model-path#profile` keys.
 - `exact_command`
 - `confidence`: `low`, `medium`, or `high` for the top command
 - `key_metrics`
@@ -88,9 +91,23 @@ Markdown reports put the comparison table first:
 - `stale_profiles`
 - `next_suggested_test`
 
-Each metric includes model path, profile id, source run id, source candidate id,
-model kind, quant, native context, test kind, requested context, validated prompt
-tokens, validation level, compatibility, metrics, risk, confidence, a short
-`why`, and exact command.
+Each metric includes model path, `profile_key`, profile id, source run id, source
+candidate id, model kind, quant, native context, test kind, requested context,
+validated prompt tokens, validation level, compatibility, metrics, risk,
+confidence, a short `why`, and exact command.
 
 This is the main interface for future agents that need a quick, low-token answer.
+
+## `recommend --agent`
+
+`recommend --agent` prints one compact JSON object for the selected model and
+profile:
+
+- `model_path`
+- `profile_id`
+- `profile_key`
+- `confidence`
+- `command`
+- `output_toks_per_s`, `prompt_toks_per_s`, `ttft_ms`
+- `requested_context`, `validated_prompt_tokens`, `validation_level`
+- `next_suggested_test`

@@ -34,6 +34,14 @@ llama-cpp-profiler tune ~/Models/Qwopus3.6-35B-A3B-Coder-MTP --ctx 262144 --pres
 llama-cpp-profiler serve ~/Models/Qwopus3.6-35B-A3B-Coder-MTP --profile interactive-fast --print
 ```
 
+Or use the high-level command that tunes and prints the selected server command
+in one step:
+
+```bash
+llama-cpp-profiler recommend ~/Models/Qwopus3.6-35B-A3B-Coder-MTP --preset quick
+llama-cpp-profiler recommend ~/Models/Qwopus3.6-35B-A3B-Coder-MTP --preset quick --agent
+```
+
 ## Usage
 
 Scan a model store:
@@ -67,6 +75,15 @@ each candidate. It can promote safer or more aggressive already-planned
 candidates from observed results, but stays within the selected preset or
 `--max-runs` budget. It does not run a 250k-token prompt.
 
+By default, tuning starts at the model's native context length when GGUF metadata
+reports it, capped by `--ctx`. Lower-context fallback candidates are kept in the
+plan and can be promoted after OOM, timeout, crash, or too-tight runs.
+
+For an explicit near-full prompt-ingest check during tuning, opt in with
+`--near-full-ingest`. The target is about 94% of the requested context, so a
+266k context run targets roughly 250k estimated prompt tokens. Override it with
+`--near-full-target-tokens`.
+
 Preview the hardware-aware candidate plan without starting servers. `--plan`
 prints JSON; `--json` is accepted only with `--plan` for compatibility with
 agent workflows.
@@ -99,8 +116,9 @@ llama-cpp-profiler report ~/Models --include-stale
 ```
 
 The human report prints comparison tables. `--agent` emits compact JSON with best
-profile ids, source run/candidate/context, validation level, the exact best
-command, key metrics, failures, stale runs, and the next suggested test.
+profile keys in `model-path#profile` form, source run/candidate/context,
+validation level, the exact best command, key metrics, failures, stale runs, and
+the next suggested test.
 
 Export managed notes or client labels:
 
@@ -122,7 +140,8 @@ selected, `export` prints the generated Markdown block.
 ```bash
 llama-cpp-profiler scan PATH [--no-tui]
 llama-cpp-profiler inspect PATH [--json]
-llama-cpp-profiler tune PATH [--ctx TOKENS] [--preset quick|standard|thorough] [--max-runs N] [--min-vram-free-mib MIB] [--max-swap-delta-mib MIB] [--port-start PORT] [--gpu-index INDEX] [--plan] [--json]
+llama-cpp-profiler tune PATH [--ctx TOKENS] [--preset quick|standard|thorough] [--max-runs N] [--min-vram-free-mib MIB] [--max-swap-delta-mib MIB] [--port-start PORT] [--gpu-index INDEX] [--near-full-ingest] [--near-full-target-tokens TOKENS] [--plan] [--json]
+llama-cpp-profiler recommend PATH [--ctx TOKENS] [--preset quick|standard|thorough] [--max-runs N] [--profile ID] [--port PORT] [--min-vram-free-mib MIB] [--max-swap-delta-mib MIB] [--port-start PORT] [--gpu-index INDEX] [--near-full-ingest] [--near-full-target-tokens TOKENS] [--agent]
 llama-cpp-profiler fullctx PATH [--profile ID] [--target-tokens TOKENS] [--ctx TOKENS] [--min-vram-free-mib MIB] [--max-swap-delta-mib MIB] [--port-start PORT] [--gpu-index INDEX]
 llama-cpp-profiler report PATH [--agent] [--include-stale]
 llama-cpp-profiler serve PATH [--profile ID] [--port PORT] [--print] [--allow-stale]
@@ -135,11 +154,14 @@ llama-cpp-profiler export PATH [--markdown] [--opencode PATH] [--dry-run] [--wri
 - Tune port range starts at `18180`; serve defaults to `18080`.
 - Default context cap is `262144`; the actual requested context is
   `min(native_context, --ctx)` when GGUF metadata reports native context.
+- Candidate plans try that native/capped context first. Lower-context fallbacks
+  are available for adaptive promotion after failed or too-tight runs.
 - Safety defaults are `--min-vram-free-mib 512` and `--max-swap-delta-mib 1024`.
 - `quick` runs at most 6 candidates; `standard` runs at most 16; `thorough` runs a broader sweep.
 - `quick` runs are labeled `smoke`; `standard` and `thorough` runs are labeled
   `standard-ingest`; `fullctx` runs are labeled `fullctx`.
-- `fullctx` is the only command that targets near-full prompts.
+- `fullctx` targets near-full prompts by default. `tune` and `recommend` can run
+  one optional near-full ingest probe with `--near-full-ingest`.
 - Stale or legacy runs are excluded from best-profile selection by default.
 - Export is dry-run unless `--write` is present.
 - `LLAMA_SERVER=/path/to/llama-server` overrides the executable used for

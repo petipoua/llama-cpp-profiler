@@ -43,10 +43,12 @@ and compute-buffer fit often dominate.
 Candidate planning uses the current environment snapshot to keep likely-safe
 candidates ahead of aggressive ones. The risk heuristic compares model size plus
 an approximate KV-cache footprint against total detected VRAM; if VRAM is not
-available, the conservative default order is preserved. During `tune`, passed
-runs with at least 2 GiB free VRAM can promote more aggressive already-planned
-candidates, while OOM, timeout, crash, or too-tight runs can promote safer
-already-planned candidates. This stays within the selected preset or `--max-runs`
+available, the conservative default order is preserved. The first candidates use
+the model's native context length, capped by `--ctx`. Lower-context fallbacks are
+kept later in the queue. During `tune`, passed runs with at least 2 GiB free VRAM
+can promote more aggressive already-planned candidates, while OOM, timeout,
+crash, or too-tight runs can promote safer already-planned candidates, including
+lower-context fallbacks. This stays within the selected preset or `--max-runs`
 budget. `tune --plan` exposes the initial ordered candidates as JSON without
 starting servers.
 
@@ -74,6 +76,12 @@ evidence: future agents should not retry the same aggressive settings blindly.
 `quick` results are labeled with smoke validation even though the ingest probe is
 still run at the smaller 16k-token target. `standard` and `thorough` results are
 labeled `standard-ingest`.
+
+`tune --near-full-ingest` and `recommend --near-full-ingest` add one opt-in
+`near_full_ingest` probe using a one-shot repeated-text prompt just below the
+requested context. The default target is about 94% of the requested context, so a
+266k context run targets roughly 250k estimated prompt tokens. This is separate
+from normal tuning because it can take substantially longer.
 
 `fullctx` is explicit opt-in and sends only the near-full prompt probe,
 defaulting to about 250k target tokens and `max_tokens = 1`. It exists for TTFT
