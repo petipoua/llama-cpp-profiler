@@ -30,6 +30,7 @@ struct AgentReport {
     schema_version: u32,
     best_profile_ids: Vec<String>,
     exact_command: Option<String>,
+    confidence: Option<String>,
     key_metrics: Vec<AgentMetric>,
     failures: Vec<String>,
     stale_profiles: Vec<String>,
@@ -39,6 +40,9 @@ struct AgentReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AgentMetric {
     model_path: PathBuf,
+    model_kind: crate::gguf::ModelKind,
+    quant: Option<String>,
+    native_context: Option<u64>,
     profile_id: String,
     source_run_id: String,
     source_candidate_id: String,
@@ -51,6 +55,8 @@ struct AgentMetric {
     ttft_ms: Option<u64>,
     headroom_mib: Option<u64>,
     risk: String,
+    confidence: String,
+    why: String,
     compatibility: crate::environment::Compatibility,
     exact_command: String,
 }
@@ -343,11 +349,17 @@ fn print_agent_report(profiled: &[(GgufMetadata, RecommendationFile)]) -> Result
     let exact_command = all_profiles
         .first()
         .map(|(_, profile)| profile.command_display.clone());
+    let confidence = all_profiles
+        .first()
+        .map(|(_, profile)| confidence_label(profile).to_string());
     let key_metrics = all_profiles
         .iter()
         .take(8)
         .map(|(metadata, profile)| AgentMetric {
             model_path: metadata.path.clone(),
+            model_kind: metadata.model_kind.clone(),
+            quant: metadata.quant.clone(),
+            native_context: metadata.native_context,
             profile_id: profile.id.clone(),
             source_run_id: profile.source_run_id.clone(),
             source_candidate_id: profile.source_candidate_id.clone(),
@@ -360,6 +372,8 @@ fn print_agent_report(profiled: &[(GgufMetadata, RecommendationFile)]) -> Result
             ttft_ms: profile.ttft_ms,
             headroom_mib: profile.headroom_mib,
             risk: profile.risk.clone(),
+            confidence: confidence_label(profile).to_string(),
+            why: agent_why(profile),
             compatibility: profile.compatibility,
             exact_command: profile.command_display.clone(),
         })
@@ -368,6 +382,7 @@ fn print_agent_report(profiled: &[(GgufMetadata, RecommendationFile)]) -> Result
         schema_version: crate::profile::SCHEMA_VERSION,
         best_profile_ids,
         exact_command,
+        confidence,
         key_metrics,
         failures: failures.into_iter().take(12).collect(),
         stale_profiles: stale_profiles.into_iter().take(12).collect(),
@@ -375,6 +390,25 @@ fn print_agent_report(profiled: &[(GgufMetadata, RecommendationFile)]) -> Result
     };
     println!("{}", serde_json::to_string(&report)?);
     Ok(())
+}
+
+fn confidence_label(profile: &Recommendation) -> &'static str {
+    match (profile.validation_level, profile.risk.as_str()) {
+        (crate::profile::ValidationLevel::Fullctx, "low" | "medium") => "high",
+        (crate::profile::ValidationLevel::StandardIngest, "low" | "medium") => "medium",
+        (crate::profile::ValidationLevel::Smoke, "low" | "medium") => "low",
+        _ => "low",
+    }
+}
+
+fn agent_why(profile: &Recommendation) -> String {
+    format!(
+        "{}; out {}; prompt {}; headroom {}",
+        profile.id,
+        fmt_f64(profile.output_toks_per_s),
+        fmt_f64(profile.prompt_toks_per_s),
+        fmt_mib(profile.headroom_mib)
+    )
 }
 
 fn export_markdown(

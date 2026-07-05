@@ -43,9 +43,12 @@ and compute-buffer fit often dominate.
 Candidate planning uses the current environment snapshot to keep likely-safe
 candidates ahead of aggressive ones. The risk heuristic compares model size plus
 an approximate KV-cache footprint against total detected VRAM; if VRAM is not
-available, the conservative default order is preserved. The sweep remains
-intentionally bounded; `tune --plan` exposes the ordered candidates as JSON
-without starting servers.
+available, the conservative default order is preserved. During `tune`, passed
+runs with at least 2 GiB free VRAM can promote more aggressive already-planned
+candidates, while OOM, timeout, crash, or too-tight runs can promote safer
+already-planned candidates. This stays within the selected preset or `--max-runs`
+budget. `tune --plan` exposes the initial ordered candidates as JSON without
+starting servers.
 
 ## MoE Models
 
@@ -83,7 +86,7 @@ of network access.
 
 ## Scoring
 
-Profiles are selected from runs that pass safety limits:
+Profiles are selected from observed runs that pass safety limits:
 
 - `interactive-fast`: maximize generation speed.
 - `interactive-safe`: maximize generation speed with at least 1 GiB free VRAM.
@@ -91,10 +94,11 @@ Profiles are selected from runs that pass safety limits:
 - `balanced`: maximize harmonic mean of generation and prompt ingest speed.
 - `quality-night`: use quant tier only as a rough quality proxy, clearly labeled.
 
-Rejected runs keep their reason: OOM, timeout, server crash, too-tight VRAM or
-swap use, interrupted, or parse-partial. `parse-partial` is still usable for
-recommendation scoring when it passes safety limits because the request
-completed but one or more llama.cpp timing lines were missing.
+Rejected runs keep a compact reason: OOM, timeout, server crash, too-tight VRAM
+or swap use, interrupted, or parse-partial, with the first failure note line when
+available. `parse-partial` is still usable for recommendation scoring when it
+passes safety limits because the request completed but one or more llama.cpp
+timing lines were missing.
 
 Legacy or changed-environment runs are listed separately as stale. They are not
 used for scoring unless a future command explicitly opts into diagnostic display.

@@ -81,32 +81,22 @@ pub struct CandidateConfig {
     pub planning_note: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum CandidateRisk {
     Low,
+    #[default]
     Medium,
     High,
 }
 
-impl Default for CandidateRisk {
-    fn default() -> Self {
-        Self::Medium
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ValidationLevel {
+    #[default]
     Smoke,
     StandardIngest,
     Fullctx,
-}
-
-impl Default for ValidationLevel {
-    fn default() -> Self {
-        Self::Smoke
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -315,7 +305,7 @@ pub fn build_recommendations(
     if let Some(result) = best_by(&usable, generation_score) {
         profiles.push(to_recommendation(
             "interactive-fast",
-            "Highest generation throughput within safety limits",
+            "Fastest observed generation throughput within safety limits",
             result,
             safety,
         ));
@@ -329,7 +319,7 @@ pub fn build_recommendations(
     if let Some(result) = best_by(&safe, generation_score) {
         profiles.push(to_recommendation(
             "interactive-safe",
-            "Generation throughput with at least 1 GiB free VRAM",
+            "Fastest observed generation throughput with at least 1 GiB free VRAM",
             result,
             safety,
         ));
@@ -338,7 +328,7 @@ pub fn build_recommendations(
     if let Some(result) = best_by(&usable, prompt_score) {
         profiles.push(to_recommendation(
             "prompt-replay",
-            "Highest prompt ingest throughput within safety limits",
+            "Fastest observed prompt ingest throughput within safety limits",
             result,
             safety,
         ));
@@ -347,7 +337,7 @@ pub fn build_recommendations(
     if let Some(result) = best_by(&usable, balanced_score) {
         profiles.push(to_recommendation(
             "balanced",
-            "Best harmonic mean of prompt and output throughput",
+            "Best observed balance of prompt and output throughput",
             result,
             safety,
         ));
@@ -356,7 +346,7 @@ pub fn build_recommendations(
     if let Some(result) = best_by(&usable, quality_score) {
         profiles.push(to_recommendation(
             "quality-night",
-            "Highest rough quant tier that starts and passes sanity",
+            "Highest observed rough quant tier that starts and passes sanity",
             result,
             safety,
         ));
@@ -785,7 +775,10 @@ fn risk_label(result: &ProfileResult, safety: &SafetyLimits) -> String {
 
 fn rejection_reason(result: &ProfileResult, safety: &SafetyLimits) -> String {
     if !result.outcome.is_usable() {
-        return format!("{:?}", result.outcome);
+        if result.note.trim().is_empty() {
+            return format!("{:?}", result.outcome);
+        }
+        return format!("{:?}: {}", result.outcome, compact_note(&result.note));
     }
     if let Some(free) = result.metrics.min_free_vram_mib
         && free < safety.min_vram_free_mib
@@ -804,6 +797,15 @@ fn rejection_reason(result: &ProfileResult, safety: &SafetyLimits) -> String {
         );
     }
     "too tight or rejected by safety policy".to_string()
+}
+
+fn compact_note(value: &str) -> String {
+    let value = value.lines().next().unwrap_or(value).trim();
+    if value.chars().count() > 120 {
+        format!("{}...", value.chars().take(117).collect::<String>())
+    } else {
+        value.to_string()
+    }
 }
 
 fn shell_escape(value: &str) -> String {

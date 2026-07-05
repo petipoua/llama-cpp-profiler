@@ -82,13 +82,15 @@ Markdown reports put the comparison table first:
 
 - `best_profile_ids`
 - `exact_command`
+- `confidence`: `low`, `medium`, or `high` for the top command
 - `key_metrics`
 - `failures`
 - `stale_profiles`
 - `next_suggested_test`
 
 Each metric includes model path, profile id, source run id, source candidate id,
-test kind, requested context, validated prompt tokens, validation level,
-compatibility, metrics, risk, and exact command.
+model kind, quant, native context, test kind, requested context, validated prompt
+tokens, validation level, compatibility, metrics, risk, confidence, a short
+`why`, and exact command.
 
 This is the main interface for future agents that need a quick, low-token answer.

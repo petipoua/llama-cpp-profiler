@@ -62,19 +62,14 @@ impl Default for ServerInfo {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Compatibility {
     Current,
+    #[default]
     LegacyMissingSnapshot,
     ServerChanged,
     HardwareChanged,
-}
-
-impl Default for Compatibility {
-    fn default() -> Self {
-        Self::LegacyMissingSnapshot
-    }
 }
 
 impl Compatibility {

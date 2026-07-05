@@ -63,7 +63,9 @@ llama-cpp-profiler tune ~/Models/<model-or-gguf> --ctx 262144 --preset standard
 
 `tune` starts one `llama-server` at a time on localhost ports beginning at `18180`,
 runs sanity/output/ingest probes, writes raw artifacts, and stops the server after
-each candidate. It does not run a 250k-token prompt.
+each candidate. It can promote safer or more aggressive already-planned
+candidates from observed results, but stays within the selected preset or
+`--max-runs` budget. It does not run a 250k-token prompt.
 
 Preview the hardware-aware candidate plan without starting servers. `--plan`
 prints JSON; `--json` is accepted only with `--plan` for compatibility with

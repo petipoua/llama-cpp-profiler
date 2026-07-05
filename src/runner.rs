@@ -13,7 +13,7 @@ use futures_util::StreamExt;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::IsTerminal;
@@ -113,17 +113,22 @@ pub async fn run_tune(path: &Path, options: TuneOptions) -> Result<Recommendatio
     let requested_context = metadata.context_or(options.ctx_cap);
     let capabilities = ServerCapabilities::detect()?;
     let environment = capabilities.environment();
-    let candidates = generate_candidates_for_environment(
+    let all_candidates = generate_candidates_for_environment(
         &metadata,
         options.preset,
         requested_context,
-        options.max_runs,
+        None,
         Some(&environment),
     );
-    if candidates.is_empty() {
+    if all_candidates.is_empty() {
         bail!("no candidates generated for {}", metadata.path.display());
     }
+    let run_budget = options
+        .max_runs
+        .unwrap_or_else(|| options.preset.max_candidates())
+        .min(all_candidates.len());
     if options.plan_only {
+        let candidates = all_candidates.iter().take(run_budget).cloned().collect();
         let plan = crate::profile::CandidatePlan {
             schema_version: SCHEMA_VERSION,
             generated_at: Utc::now(),
@@ -150,13 +155,21 @@ pub async fn run_tune(path: &Path, options: TuneOptions) -> Result<Recommendatio
     fs::create_dir_all(profiler_dir.join("runs"))?;
     fs::create_dir_all(profiler_dir.join("reports"))?;
 
-    let total_candidates = candidates.len();
-    for (index, candidate) in candidates.into_iter().enumerate() {
-        let port = find_open_port(options.port_start + index as u16)?;
+    let mut queue = VecDeque::from(all_candidates.clone());
+    let mut seen = BTreeSet::new();
+    let mut completed = 0usize;
+    while completed < run_budget {
+        let Some(candidate) = queue.pop_front() else {
+            break;
+        };
+        if !seen.insert(candidate.id.clone()) {
+            continue;
+        }
+        let port = find_open_port(options.port_start + completed as u16)?;
         eprintln!(
             "[{}/{}] {} on port {}",
-            index + 1,
-            total_candidates,
+            completed + 1,
+            run_budget,
             candidate.id,
             port
         );
@@ -190,6 +203,8 @@ pub async fn run_tune(path: &Path, options: TuneOptions) -> Result<Recommendatio
             result.metrics.server_prompt_eval_toks_per_s,
             result.metrics.min_free_vram_mib
         );
+        completed += 1;
+        promote_adaptive_candidates(&mut queue, &seen, &result);
     }
 
     write_manifest(&metadata)?;
@@ -206,6 +221,85 @@ pub async fn run_tune(path: &Path, options: TuneOptions) -> Result<Recommendatio
     )?;
     report::write_latest_markdown(&metadata.profiler_dir(), &recommendations)?;
     Ok(recommendations)
+}
+
+fn promote_adaptive_candidates(
+    queue: &mut VecDeque<CandidateConfig>,
+    seen: &BTreeSet<String>,
+    result: &ProfileResult,
+) {
+    let want_more_aggressive = result.outcome == Outcome::Pass
+        && result
+            .metrics
+            .min_free_vram_mib
+            .is_some_and(|free| free >= 2048);
+    let want_safer = matches!(
+        result.outcome,
+        Outcome::Oom | Outcome::TooTight | Outcome::Timeout | Outcome::ServerCrash
+    );
+    if !want_more_aggressive && !want_safer {
+        return;
+    }
+
+    let base_score = candidate_aggressiveness(&result.candidate);
+    let mut matches = queue
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| !seen.contains(&candidate.id))
+        .filter(|(_, candidate)| same_candidate_family(&result.candidate, candidate))
+        .filter_map(|(index, candidate)| {
+            let score = candidate_aggressiveness(candidate);
+            if want_more_aggressive && score > base_score {
+                Some((index, score - base_score))
+            } else if want_safer && score < base_score {
+                Some((index, base_score - score))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    matches.sort_by_key(|(_, delta)| std::cmp::Reverse(*delta));
+    let mut promoted = Vec::new();
+    for (index, _) in matches.into_iter().take(2) {
+        if let Some(candidate) = queue.get(index) {
+            promoted.push(candidate.id.clone());
+        }
+    }
+    for id in promoted.into_iter().rev() {
+        if let Some(index) = queue.iter().position(|candidate| candidate.id == id)
+            && let Some(candidate) = queue.remove(index)
+        {
+            queue.push_front(candidate);
+        }
+    }
+}
+
+fn same_candidate_family(left: &CandidateConfig, right: &CandidateConfig) -> bool {
+    left.id.split('-').next() == right.id.split('-').next()
+        && left.requested_context == right.requested_context
+}
+
+fn candidate_aggressiveness(candidate: &CandidateConfig) -> i64 {
+    let batch = candidate.batch.unwrap_or(0) as i64 / 1024;
+    let ubatch = candidate.ubatch.unwrap_or(0) as i64 / 512;
+    let fit = candidate
+        .fit_target
+        .map_or(0, |value| (2048_i64 - value.min(2048) as i64).max(0) / 128);
+    let kv = match candidate.kv_cache.as_deref() {
+        Some("q8_0") => 2,
+        Some("q4_0") => 1,
+        _ => 0,
+    };
+    let moe = if candidate.cpu_moe {
+        -64
+    } else {
+        candidate
+            .n_cpu_moe
+            .map(|value| 64_i64.saturating_sub(value as i64))
+            .unwrap_or(0)
+    };
+    batch + ubatch + fit + kv + moe
 }
 
 pub async fn run_fullctx(path: &Path, options: FullCtxOptions) -> Result<ProfileResult> {
@@ -1282,6 +1376,24 @@ llama_perf_context_print:        prompt eval time =   1000.00 ms / 16000 tokens 
         assert_eq!(updated[2], "18080");
     }
 
+    #[test]
+    fn adaptive_promotes_more_aggressive_candidate_after_headroom() {
+        let base = test_candidate("dense-q8_0-fit1536-b1024-ub256", 1024, 256, 1536);
+        let aggressive = test_candidate("dense-q8_0-fit512-b16384-ub4096", 16384, 4096, 512);
+        let unrelated = test_candidate("moe-q8_0-cpu-moe-b1024-ub256", 1024, 256, 1536);
+        let mut queue = VecDeque::from(vec![unrelated, aggressive.clone()]);
+        let mut seen = BTreeSet::new();
+        seen.insert(base.id.clone());
+        let result = test_result(base, Outcome::Pass, Some(4096));
+
+        promote_adaptive_candidates(&mut queue, &seen, &result);
+
+        assert_eq!(
+            queue.front().map(|candidate| candidate.id.as_str()),
+            Some(aggressive.id.as_str())
+        );
+    }
+
     #[tokio::test]
     async fn parses_streaming_chat_completion_from_fake_server() {
         use std::io::{Read, Write};
@@ -1316,5 +1428,84 @@ llama_perf_context_print:        prompt eval time =   1000.00 ms / 16000 tokens 
         assert_eq!(probe.summary.response_excerpt.as_deref(), Some("K"));
         assert_eq!(probe.summary.completion_tokens, Some(1));
         assert!(probe.summary.ttft_ms.is_some());
+    }
+
+    fn test_candidate(id: &str, batch: u64, ubatch: u64, fit_target: u64) -> CandidateConfig {
+        CandidateConfig {
+            id: id.to_string(),
+            requested_context: 4096,
+            batch: Some(batch),
+            ubatch: Some(ubatch),
+            kv_cache: Some("q8_0".to_string()),
+            fit_target: Some(fit_target),
+            gpu_layers: None,
+            cpu_moe: id.contains("cpu-moe"),
+            n_cpu_moe: None,
+            expected_risk: crate::profile::CandidateRisk::Medium,
+            note: String::new(),
+            planning_note: String::new(),
+        }
+    }
+
+    fn test_result(
+        candidate: CandidateConfig,
+        outcome: Outcome,
+        free_vram: Option<u64>,
+    ) -> ProfileResult {
+        let gguf = GgufMetadata {
+            path: PathBuf::from("/models/test.gguf"),
+            file_name: "test.gguf".to_string(),
+            file_size_bytes: 1,
+            gguf_version: 3,
+            tensor_count: 0,
+            metadata_kv_count: 0,
+            name: Some("test".to_string()),
+            architecture: Some("llama".to_string()),
+            size_label: None,
+            native_context: Some(4096),
+            block_count: Some(1),
+            expert_count: None,
+            expert_used_count: None,
+            tokenizer_has_chat_template: false,
+            quant: Some("Q4_K_M".to_string()),
+            file_type: None,
+            model_kind: crate::gguf::ModelKind::Dense,
+            metadata: BTreeMap::new(),
+        };
+        ProfileResult {
+            schema_version: SCHEMA_VERSION,
+            run_id: "test".to_string(),
+            started_at: Utc::now(),
+            ended_at: Utc::now(),
+            model_path: gguf.path.clone(),
+            model_size_bytes: gguf.file_size_bytes,
+            gguf: gguf.clone(),
+            quant: gguf.quant.clone(),
+            command: vec!["llama-server".to_string()],
+            command_display: "llama-server".to_string(),
+            candidate,
+            test_kind: "tune".to_string(),
+            requested_context: 4096,
+            prompt_tokens: None,
+            completion_tokens: None,
+            metrics: crate::profile::RunMetrics {
+                min_free_vram_mib: free_vram,
+                ..crate::profile::RunMetrics::default()
+            },
+            probes: BTreeMap::new(),
+            outcome,
+            artifacts: ArtifactPaths {
+                command: PathBuf::from("command.sh"),
+                server_log: PathBuf::from("server.log"),
+                telemetry_jsonl: PathBuf::from("telemetry.jsonl"),
+                request_json: PathBuf::from("request.json"),
+                response_json: PathBuf::from("response.json"),
+                result_json: PathBuf::from("result.json"),
+            },
+            note: String::new(),
+            environment: None,
+            validation_level: ValidationLevel::Smoke,
+            compatibility: crate::environment::Compatibility::Current,
+        }
     }
 }
