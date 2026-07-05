@@ -1,3 +1,4 @@
+use crate::environment::{Compatibility, EnvironmentSnapshot, compare_environment};
 use crate::gguf::{GgufMetadata, ModelKind};
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
@@ -7,7 +8,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -73,7 +74,39 @@ pub struct CandidateConfig {
     pub gpu_layers: Option<u64>,
     pub cpu_moe: bool,
     pub n_cpu_moe: Option<u64>,
+    #[serde(default)]
+    pub expected_risk: CandidateRisk,
     pub note: String,
+    #[serde(default)]
+    pub planning_note: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateRisk {
+    Low,
+    Medium,
+    High,
+}
+
+impl Default for CandidateRisk {
+    fn default() -> Self {
+        Self::Medium
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationLevel {
+    Smoke,
+    StandardIngest,
+    Fullctx,
+}
+
+impl Default for ValidationLevel {
+    fn default() -> Self {
+        Self::Smoke
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -151,6 +184,12 @@ pub struct ProfileResult {
     pub outcome: Outcome,
     pub artifacts: ArtifactPaths,
     pub note: String,
+    #[serde(default)]
+    pub environment: Option<EnvironmentSnapshot>,
+    #[serde(default)]
+    pub validation_level: ValidationLevel,
+    #[serde(default)]
+    pub compatibility: Compatibility,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -169,6 +208,10 @@ pub struct RecommendationFile {
     pub model_path: PathBuf,
     pub profiles: Vec<Recommendation>,
     pub rejected: Vec<RejectedRun>,
+    #[serde(default)]
+    pub stale: Vec<StaleRun>,
+    #[serde(default)]
+    pub environment: Option<EnvironmentSnapshot>,
     pub next_suggested_test: Option<String>,
 }
 
@@ -177,6 +220,20 @@ pub struct Recommendation {
     pub id: String,
     pub role: String,
     pub source_run_id: String,
+    #[serde(default)]
+    pub source_candidate_id: String,
+    #[serde(default)]
+    pub source_test_kind: String,
+    #[serde(default)]
+    pub requested_context: u64,
+    #[serde(default)]
+    pub validated_prompt_tokens: Option<u64>,
+    #[serde(default)]
+    pub validation_level: ValidationLevel,
+    #[serde(default)]
+    pub compatibility: Compatibility,
+    #[serde(default)]
+    pub stale_reason: Option<String>,
     pub command: Vec<String>,
     pub command_display: String,
     pub output_toks_per_s: Option<f64>,
@@ -196,17 +253,47 @@ pub struct RejectedRun {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StaleRun {
+    pub run_id: String,
+    pub candidate_id: String,
+    pub compatibility: Compatibility,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CandidatePlan {
+    pub schema_version: u32,
+    pub generated_at: DateTime<Utc>,
+    pub model_path: PathBuf,
+    pub requested_context: u64,
+    pub preset: Preset,
+    pub environment: EnvironmentSnapshot,
+    pub candidates: Vec<CandidateConfig>,
+}
+
 pub fn generate_candidates(
     metadata: &GgufMetadata,
     preset: Preset,
     requested_context: u64,
     max_runs: Option<usize>,
 ) -> Vec<CandidateConfig> {
+    generate_candidates_for_environment(metadata, preset, requested_context, max_runs, None)
+}
+
+pub fn generate_candidates_for_environment(
+    metadata: &GgufMetadata,
+    preset: Preset,
+    requested_context: u64,
+    max_runs: Option<usize>,
+    environment: Option<&EnvironmentSnapshot>,
+) -> Vec<CandidateConfig> {
     let cap = max_runs.unwrap_or_else(|| preset.max_candidates());
     let mut candidates = match metadata.model_kind {
         ModelKind::Moe => moe_candidates(metadata, requested_context),
         ModelKind::Dense | ModelKind::Unknown => dense_candidates(requested_context),
     };
+    annotate_and_order_candidates(&mut candidates, metadata, environment);
     candidates.truncate(cap);
     candidates
 }
@@ -215,12 +302,14 @@ pub fn build_recommendations(
     model_path: PathBuf,
     results: &[ProfileResult],
     safety: &SafetyLimits,
+    current_environment: Option<&EnvironmentSnapshot>,
 ) -> RecommendationFile {
     let mut profiles = Vec::new();
     let usable: Vec<&ProfileResult> = results
         .iter()
         .filter(|result| result.outcome.is_usable())
         .filter(|result| passes_safety(result, safety))
+        .filter(|result| run_compatibility(result, current_environment).is_current())
         .collect();
 
     if let Some(result) = best_by(&usable, generation_score) {
@@ -277,15 +366,28 @@ pub fn build_recommendations(
     let rejected = results
         .iter()
         .filter(|result| {
-            !result.outcome.is_usable()
-                || !passes_safety(result, safety)
-                || matches!(result.outcome, Outcome::TooTight)
+            run_compatibility(result, current_environment).is_current()
+                && (!result.outcome.is_usable()
+                    || !passes_safety(result, safety)
+                    || matches!(result.outcome, Outcome::TooTight))
         })
         .map(|result| RejectedRun {
             run_id: result.run_id.clone(),
             candidate_id: result.candidate.id.clone(),
             outcome: result.outcome.clone(),
             reason: rejection_reason(result, safety),
+        })
+        .collect();
+    let stale = results
+        .iter()
+        .filter_map(|result| {
+            let compatibility = run_compatibility(result, current_environment);
+            (!compatibility.is_current()).then(|| StaleRun {
+                run_id: result.run_id.clone(),
+                candidate_id: result.candidate.id.clone(),
+                compatibility,
+                reason: compatibility.reason().to_string(),
+            })
         })
         .collect();
 
@@ -306,6 +408,8 @@ pub fn build_recommendations(
         model_path,
         profiles,
         rejected,
+        stale,
+        environment: current_environment.cloned(),
         next_suggested_test,
     }
 }
@@ -373,7 +477,9 @@ fn dense_candidates(requested_context: u64) -> Vec<CandidateConfig> {
             gpu_layers: None,
             cpu_moe: false,
             n_cpu_moe: None,
+            expected_risk: CandidateRisk::Medium,
             note: "dense sweep over batch, ubatch, KV cache, and llama.cpp fit target".to_string(),
+            planning_note: String::new(),
         });
     }
 
@@ -404,8 +510,10 @@ fn dense_candidates(requested_context: u64) -> Vec<CandidateConfig> {
                     gpu_layers: None,
                     cpu_moe: false,
                     n_cpu_moe: None,
+                    expected_risk: CandidateRisk::Medium,
                     note: "dense sweep over batch, ubatch, KV cache, and llama.cpp fit target"
                         .to_string(),
+                    planning_note: String::new(),
                 });
             }
         }
@@ -427,7 +535,9 @@ fn moe_candidates(metadata: &GgufMetadata, requested_context: u64) -> Vec<Candid
                 gpu_layers: None,
                 cpu_moe: true,
                 n_cpu_moe: None,
+                expected_risk: CandidateRisk::Low,
                 note: "MoE baseline with CPU expert offload enabled".to_string(),
+                planning_note: String::new(),
             });
         }
     }
@@ -465,8 +575,10 @@ fn moe_candidates(metadata: &GgufMetadata, requested_context: u64) -> Vec<Candid
                     gpu_layers: None,
                     cpu_moe: false,
                     n_cpu_moe: Some(*n_cpu_moe),
+                    expected_risk: CandidateRisk::Medium,
                     note: "MoE sweep from safer CPU-heavy expert placement toward GPU residency"
                         .to_string(),
+                    planning_note: String::new(),
                 });
             }
         }
@@ -483,10 +595,85 @@ fn moe_candidates(metadata: &GgufMetadata, requested_context: u64) -> Vec<Candid
             gpu_layers: None,
             cpu_moe: true,
             n_cpu_moe: None,
+            expected_risk: CandidateRisk::Low,
             note: "MoE baseline with CPU expert offload enabled".to_string(),
+            planning_note: String::new(),
         });
     }
     candidates
+}
+
+fn annotate_and_order_candidates(
+    candidates: &mut [CandidateConfig],
+    metadata: &GgufMetadata,
+    environment: Option<&EnvironmentSnapshot>,
+) {
+    let total_vram = environment.and_then(total_vram_mib);
+    let model_mib = metadata.file_size_bytes / 1024 / 1024;
+    for candidate in candidates.iter_mut() {
+        let risk = candidate_risk(candidate, model_mib, total_vram);
+        candidate.expected_risk = risk;
+        candidate.planning_note = match (total_vram, risk) {
+            (Some(vram), CandidateRisk::Low) => {
+                format!(
+                    "model is {model_mib} MiB against {vram} MiB total VRAM; safe-first candidate"
+                )
+            }
+            (Some(vram), CandidateRisk::Medium) => {
+                format!(
+                    "model is {model_mib} MiB against {vram} MiB total VRAM; normal tuning candidate"
+                )
+            }
+            (Some(vram), CandidateRisk::High) => {
+                format!(
+                    "model is {model_mib} MiB against {vram} MiB total VRAM; aggressive candidate"
+                )
+            }
+            (None, _) => {
+                "hardware VRAM unavailable; preserving conservative default order".to_string()
+            }
+        };
+    }
+    candidates.sort_by_key(|candidate| match candidate.expected_risk {
+        CandidateRisk::Low => 0,
+        CandidateRisk::Medium => 1,
+        CandidateRisk::High => 2,
+    });
+}
+
+fn candidate_risk(
+    candidate: &CandidateConfig,
+    model_mib: u64,
+    total_vram_mib: Option<u64>,
+) -> CandidateRisk {
+    if candidate.cpu_moe {
+        return CandidateRisk::Low;
+    }
+    let Some(total_vram_mib) = total_vram_mib else {
+        return CandidateRisk::Medium;
+    };
+    let kv_risk_mib = match candidate.kv_cache.as_deref() {
+        Some("q8_0") => candidate.requested_context / 128,
+        Some("q4_0") => candidate.requested_context / 256,
+        _ => candidate.requested_context / 192,
+    };
+    let working_set = model_mib.saturating_add(kv_risk_mib);
+    if working_set.saturating_mul(100) < total_vram_mib.saturating_mul(70) {
+        CandidateRisk::Low
+    } else if working_set.saturating_mul(100) < total_vram_mib.saturating_mul(90) {
+        CandidateRisk::Medium
+    } else {
+        CandidateRisk::High
+    }
+}
+
+fn total_vram_mib(environment: &EnvironmentSnapshot) -> Option<u64> {
+    let total = environment
+        .gpus
+        .iter()
+        .filter_map(|gpu| gpu.total_vram_mib)
+        .sum::<u64>();
+    (total > 0).then_some(total)
 }
 
 fn passes_safety(result: &ProfileResult, safety: &SafetyLimits) -> bool {
@@ -548,6 +735,13 @@ fn to_recommendation(
         id: id.to_string(),
         role: role.to_string(),
         source_run_id: result.run_id.clone(),
+        source_candidate_id: result.candidate.id.clone(),
+        source_test_kind: result.test_kind.clone(),
+        requested_context: result.requested_context,
+        validated_prompt_tokens: result.prompt_tokens,
+        validation_level: result.validation_level,
+        compatibility: result.compatibility,
+        stale_reason: None,
         command: result.command.clone(),
         command_display: result.command_display.clone(),
         output_toks_per_s: result.metrics.server_generation_toks_per_s,
@@ -558,6 +752,15 @@ fn to_recommendation(
         risk: risk_label(result, safety),
         note: result.note.clone(),
     }
+}
+
+fn run_compatibility(
+    result: &ProfileResult,
+    current_environment: Option<&EnvironmentSnapshot>,
+) -> Compatibility {
+    current_environment.map_or(result.compatibility, |current| {
+        compare_environment(result.environment.as_ref(), current)
+    })
 }
 
 fn dedupe_profiles(profiles: &mut Vec<Recommendation>) {
@@ -631,6 +834,7 @@ mod tests {
             PathBuf::from("/models/test.gguf"),
             &results,
             &SafetyLimits::default(),
+            Some(&fake_environment()),
         );
 
         let fast = recs
@@ -710,7 +914,9 @@ mod tests {
                 gpu_layers: None,
                 cpu_moe: false,
                 n_cpu_moe: None,
+                expected_risk: CandidateRisk::Medium,
                 note: String::new(),
+                planning_note: String::new(),
             },
             test_kind: "tune".to_string(),
             requested_context: 4096,
@@ -733,6 +939,106 @@ mod tests {
                 result_json: PathBuf::from("result.json"),
             },
             note: String::new(),
+            environment: Some(fake_environment()),
+            validation_level: ValidationLevel::StandardIngest,
+            compatibility: crate::environment::Compatibility::Current,
+        }
+    }
+
+    #[test]
+    fn stale_runs_are_excluded_from_recommendations() {
+        let gguf = fake_metadata(Some("Q4_K_M"));
+        let current = fake_environment();
+        let mut stale_environment = current.clone();
+        stale_environment.llama_server.help_hash = Some("changed".to_string());
+        let mut stale = fake_result("stale-fast", &gguf, 100.0, 100.0, Some(4096), Outcome::Pass);
+        stale.environment = Some(stale_environment);
+        let current_run = fake_result(
+            "current-slow",
+            &gguf,
+            10.0,
+            100.0,
+            Some(4096),
+            Outcome::Pass,
+        );
+        let recs = build_recommendations(
+            PathBuf::from("/models/test.gguf"),
+            &[stale, current_run],
+            &SafetyLimits::default(),
+            Some(&current),
+        );
+        let fast = recs
+            .profiles
+            .iter()
+            .find(|profile| profile.id == "interactive-fast")
+            .unwrap();
+        assert_eq!(fast.source_run_id, "current-slow");
+        assert_eq!(recs.stale.len(), 1);
+        assert_eq!(recs.stale[0].run_id, "stale-fast");
+    }
+
+    #[test]
+    fn v1_result_deserializes_as_legacy_stale() {
+        let json = serde_json::json!({
+            "schema_version": 1,
+            "run_id": "legacy",
+            "started_at": Utc::now(),
+            "ended_at": Utc::now(),
+            "model_path": "/models/test.gguf",
+            "model_size_bytes": 1,
+            "gguf": fake_metadata(Some("Q4_K_M")),
+            "quant": "Q4_K_M",
+            "command": ["llama-server"],
+            "command_display": "llama-server",
+            "candidate": {
+                "id": "legacy",
+                "requested_context": 4096,
+                "batch": null,
+                "ubatch": null,
+                "kv_cache": null,
+                "fit_target": null,
+                "gpu_layers": null,
+                "cpu_moe": false,
+                "n_cpu_moe": null,
+                "note": ""
+            },
+            "test_kind": "tune",
+            "requested_context": 4096,
+            "prompt_tokens": 100,
+            "completion_tokens": 100,
+            "metrics": {},
+            "probes": {},
+            "outcome": "pass",
+            "artifacts": {
+                "command": "command.sh",
+                "server_log": "server.log",
+                "telemetry_jsonl": "telemetry.jsonl",
+                "request_json": "request.json",
+                "response_json": "response.json",
+                "result_json": "result.json"
+            },
+            "note": ""
+        });
+        let result: ProfileResult = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            result.compatibility,
+            crate::environment::Compatibility::LegacyMissingSnapshot
+        );
+        assert_eq!(result.validation_level, ValidationLevel::Smoke);
+        assert!(result.environment.is_none());
+    }
+
+    fn fake_environment() -> EnvironmentSnapshot {
+        EnvironmentSnapshot {
+            llama_server: crate::environment::ServerInfo {
+                executable: "llama-server".to_string(),
+                resolved_path: Some(PathBuf::from("/usr/bin/llama-server")),
+                version: Some("test".to_string()),
+                help_hash: Some("help".to_string()),
+                usable: true,
+                error: None,
+            },
+            ..EnvironmentSnapshot::default()
         }
     }
 }
