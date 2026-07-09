@@ -1,15 +1,16 @@
 use crate::environment::{EnvironmentSnapshot, capture_environment, compare_environment};
-use crate::gguf::{GgufMetadata, read_metadata, resolve_model_path};
+use crate::gguf::{GgufMetadata, ModelIdentity, read_metadata, resolve_model_path};
 use crate::profile::{
     ArtifactPaths, CandidateConfig, Manifest, Outcome, Preset, ProbeSummary, ProfileResult,
-    Recommendation, RecommendationFile, SCHEMA_VERSION, SafetyLimits, ValidationLevel,
-    build_recommendations, command_display, generate_candidates,
+    Recommendation, RecommendationFile, SCHEMA_VERSION, SafetyLimits, TelemetryStatus,
+    ValidationLevel, build_recommendations_for_model, command_display, generate_candidates,
     generate_candidates_for_environment,
 };
 use crate::report;
 use crate::telemetry::TelemetrySampler;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
+use clap::ValueEnum;
 use futures_util::StreamExt;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -42,6 +43,7 @@ pub struct TuneOptions {
     pub plan_only: bool,
     pub near_full_ingest: bool,
     pub near_full_target_tokens: Option<u64>,
+    pub probe_mode: ProbeMode,
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +54,7 @@ pub struct FullCtxOptions {
     pub safety: SafetyLimits,
     pub port_start: u16,
     pub gpu_index: Option<u32>,
+    pub probe_mode: ProbeMode,
 }
 
 #[derive(Debug, Clone)]
@@ -76,22 +79,47 @@ pub struct RecommendOptions {
     pub near_full_ingest: bool,
     pub near_full_target_tokens: Option<u64>,
     pub agent: bool,
+    pub probe_mode: ProbeMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecommendOutput {
+    pub agent_schema_version: u32,
+    pub schema_version: u32,
     pub model_path: PathBuf,
+    pub model_identity: Option<ModelIdentity>,
+    pub environment_valid: bool,
+    pub telemetry_status: TelemetryStatus,
     pub profile_id: String,
     pub profile_key: String,
     pub confidence: String,
     pub command: String,
+    pub exact_command: String,
     pub output_toks_per_s: Option<f64>,
     pub prompt_toks_per_s: Option<f64>,
     pub ttft_ms: Option<u64>,
     pub requested_context: u64,
     pub validated_prompt_tokens: Option<u64>,
     pub validation_level: ValidationLevel,
+    pub risk: String,
+    pub failures: Vec<crate::profile::RejectedRun>,
+    pub stale: Vec<crate::profile::StaleRun>,
     pub next_suggested_test: Option<String>,
+}
+
+struct RecommendValidation {
+    model_identity: Option<ModelIdentity>,
+    environment_valid: bool,
+    failures: Vec<crate::profile::RejectedRun>,
+    stale: Vec<crate::profile::StaleRun>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum ProbeMode {
+    #[default]
+    Thinking,
+    Generic,
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +164,7 @@ struct RunRequest {
     candidate: CandidateConfig,
     port: u16,
     prompt_plan: PromptPlan,
+    probe_mode: ProbeMode,
 }
 
 #[derive(Debug, Clone)]
@@ -181,6 +210,7 @@ pub async fn run_tune(path: &Path, options: TuneOptions) -> Result<Recommendatio
             schema_version: SCHEMA_VERSION,
             generated_at: Utc::now(),
             model_path: metadata.path.clone(),
+            model_identity: metadata.model_identity(),
             requested_context,
             preset: options.preset,
             environment,
@@ -190,11 +220,13 @@ pub async fn run_tune(path: &Path, options: TuneOptions) -> Result<Recommendatio
         return Ok(RecommendationFile {
             schema_version: SCHEMA_VERSION,
             generated_at: Utc::now(),
-            model_path: metadata.path,
+            model_path: metadata.path.clone(),
+            model_identity: Some(metadata.model_identity()),
             profiles: Vec::new(),
             rejected: Vec::new(),
             stale: Vec::new(),
             environment: None,
+            environment_valid: false,
             next_suggested_test: None,
         });
     }
@@ -233,6 +265,7 @@ pub async fn run_tune(path: &Path, options: TuneOptions) -> Result<Recommendatio
                         .unwrap_or_else(|| near_full_ingest_target(requested_context))
                 }),
             },
+            probe_mode: options.probe_mode,
         };
         let validation_level = if options.preset == Preset::Quick {
             ValidationLevel::Smoke
@@ -262,8 +295,10 @@ pub async fn run_tune(path: &Path, options: TuneOptions) -> Result<Recommendatio
 
     write_manifest(&metadata)?;
     let all_results = load_prior_results(&metadata.profiler_dir())?;
-    let recommendations = build_recommendations(
+    let model_identity = metadata.model_identity();
+    let recommendations = build_recommendations_for_model(
         metadata.path.clone(),
+        Some(&model_identity),
         &all_results,
         &options.safety,
         Some(&environment),
@@ -290,6 +325,7 @@ pub async fn run_recommend(path: &Path, options: RecommendOptions) -> Result<Rec
             plan_only: false,
             near_full_ingest: options.near_full_ingest,
             near_full_target_tokens: options.near_full_target_tokens,
+            probe_mode: options.probe_mode,
         },
     )
     .await?;
@@ -306,6 +342,15 @@ pub async fn run_recommend(path: &Path, options: RecommendOptions) -> Result<Rec
             )
         })?;
     let command = command_display(&command_with_port(&profile.command, options.port));
+    let current_metadata = read_metadata(&model_path)?;
+    let current_identity = current_metadata.model_identity();
+    let environment_valid = recs.environment_valid
+        && recs.model_identity.as_ref() == Some(&current_identity)
+        && compare_environment(
+            recs.environment.as_ref(),
+            &current_environment_best_effort(),
+        )
+        .is_current();
     if !options.agent {
         eprintln!(
             "selected {} from {}; output {:?} tok/s, prompt {:?} tok/s",
@@ -319,6 +364,12 @@ pub async fn run_recommend(path: &Path, options: RecommendOptions) -> Result<Rec
         &model_path,
         profile,
         command,
+        RecommendValidation {
+            model_identity: recs.model_identity.clone(),
+            environment_valid,
+            failures: recs.rejected.clone(),
+            stale: recs.stale.clone(),
+        },
         recs.next_suggested_test.clone(),
     ))
 }
@@ -465,8 +516,8 @@ pub async fn run_fullctx(path: &Path, options: FullCtxOptions) -> Result<Profile
     let metadata = read_metadata(&model_path)?;
     let capabilities = ServerCapabilities::detect()?;
     let environment = capabilities.environment();
-    let candidate =
-        candidate_for_saved_profile(&metadata, &options.profile)?.unwrap_or_else(|| {
+    let candidate = candidate_for_saved_profile(&metadata, &options.profile, &environment)?
+        .unwrap_or_else(|| {
             let requested_context = metadata.context_or(options.ctx_cap);
             generate_candidates(&metadata, Preset::Quick, requested_context, Some(1))
                 .into_iter()
@@ -496,6 +547,7 @@ pub async fn run_fullctx(path: &Path, options: FullCtxOptions) -> Result<Profile
         prompt_plan: PromptPlan::FullCtx {
             target_tokens: options.target_tokens,
         },
+        probe_mode: options.probe_mode,
     };
     let result = run_candidate(
         &metadata,
@@ -509,8 +561,10 @@ pub async fn run_fullctx(path: &Path, options: FullCtxOptions) -> Result<Profile
     .await?;
     write_manifest(&metadata)?;
     let results = load_prior_results(&metadata.profiler_dir())?;
-    let recommendations = build_recommendations(
+    let model_identity = metadata.model_identity();
+    let recommendations = build_recommendations_for_model(
         metadata.path.clone(),
+        Some(&model_identity),
         &results,
         &options.safety,
         Some(&environment),
@@ -532,16 +586,27 @@ pub async fn run_serve(path: &Path, options: ServeOptions) -> Result<()> {
         .iter()
         .find(|profile| profile.id == options.profile)
         .with_context(|| format!("profile {:?} not found", options.profile))?;
-    let current_environment = capture_current_environment_best_effort();
+    let current_environment = current_environment_best_effort();
     let recommendation_compatibility =
         compare_environment(recs.environment.as_ref(), &current_environment);
+    let current_identity = metadata.model_identity();
+    let model_identity_valid = recs.model_identity.as_ref() == Some(&current_identity)
+        && profile.model_identity.as_ref() == Some(&current_identity);
     if !options.allow_stale
-        && (!profile.compatibility.is_current() || !recommendation_compatibility.is_current())
+        && (!model_identity_valid
+            || !profile.compatibility.is_current()
+            || !recommendation_compatibility.is_current())
     {
         bail!(
             "profile {:?} is stale: {}; rerun tune or pass --allow-stale",
             options.profile,
-            if !recommendation_compatibility.is_current() {
+            if !model_identity_valid {
+                if recs.model_identity.is_none() || profile.model_identity.is_none() {
+                    "legacy state is missing model identity"
+                } else {
+                    "model at this path changed"
+                }
+            } else if !recommendation_compatibility.is_current() {
                 recommendation_compatibility.reason()
             } else {
                 profile
@@ -577,13 +642,20 @@ fn recommend_output(
     model_path: &Path,
     profile: &Recommendation,
     command: String,
+    validation: RecommendValidation,
     next_suggested_test: Option<String>,
 ) -> RecommendOutput {
     RecommendOutput {
+        agent_schema_version: crate::profile::AGENT_SCHEMA_VERSION,
+        schema_version: SCHEMA_VERSION,
         model_path: model_path.to_path_buf(),
+        model_identity: validation.model_identity,
+        environment_valid: validation.environment_valid,
+        telemetry_status: profile.telemetry_status,
         profile_id: profile.id.clone(),
         profile_key: profile_key(model_path, profile),
         confidence: confidence_label(profile).to_string(),
+        exact_command: command.clone(),
         command,
         output_toks_per_s: profile.output_toks_per_s,
         prompt_toks_per_s: profile.prompt_toks_per_s,
@@ -591,6 +663,9 @@ fn recommend_output(
         requested_context: profile.requested_context,
         validated_prompt_tokens: profile.validated_prompt_tokens,
         validation_level: profile.validation_level,
+        risk: profile.risk.clone(),
+        failures: validation.failures,
+        stale: validation.stale,
         next_suggested_test,
     }
 }
@@ -608,7 +683,7 @@ fn confidence_label(profile: &Recommendation) -> &'static str {
     }
 }
 
-fn capture_current_environment_best_effort() -> EnvironmentSnapshot {
+pub fn current_environment_best_effort() -> EnvironmentSnapshot {
     let executable = std::env::var("LLAMA_SERVER").unwrap_or_else(|_| "llama-server".to_string());
     let help = std::process::Command::new(&executable)
         .arg("--help")
@@ -623,6 +698,55 @@ fn capture_current_environment_best_effort() -> EnvironmentSnapshot {
             )
         });
     capture_environment(&executable, help.as_deref())
+}
+
+pub fn validate_recommendation_file(
+    metadata: &GgufMetadata,
+    recommendations: &RecommendationFile,
+    current_environment: &EnvironmentSnapshot,
+) -> RecommendationFile {
+    let mut validated = recommendations.clone();
+    let current_identity = metadata.model_identity();
+    let identity_compatibility = match validated.model_identity.as_ref() {
+        None => Some(crate::environment::Compatibility::LegacyMissingIdentity),
+        Some(identity) if identity != &current_identity => {
+            Some(crate::environment::Compatibility::ModelChanged)
+        }
+        Some(_) => None,
+    };
+    let environment_compatibility =
+        compare_environment(validated.environment.as_ref(), current_environment);
+    validated.environment_valid = environment_compatibility.is_current();
+    let mut stale_profiles = Vec::new();
+    let profiles = std::mem::take(&mut validated.profiles);
+    for profile in profiles {
+        let profile_identity_matches = profile.model_identity.as_ref() == Some(&current_identity);
+        let profile_environment_current = profile.compatibility.is_current();
+        let compatibility = identity_compatibility
+            .or_else(|| {
+                (!environment_compatibility.is_current()).then_some(environment_compatibility)
+            })
+            .or_else(|| {
+                (!profile_identity_matches).then_some(if profile.model_identity.is_none() {
+                    crate::environment::Compatibility::LegacyMissingIdentity
+                } else {
+                    crate::environment::Compatibility::ModelChanged
+                })
+            })
+            .or_else(|| (!profile_environment_current).then_some(profile.compatibility));
+        if let Some(compatibility) = compatibility {
+            stale_profiles.push(crate::profile::StaleRun {
+                run_id: profile.source_run_id,
+                candidate_id: profile.source_candidate_id,
+                compatibility,
+                reason: compatibility.reason().to_string(),
+            });
+        } else {
+            validated.profiles.push(profile);
+        }
+    }
+    validated.stale.extend(stale_profiles);
+    validated
 }
 
 async fn run_candidate(
@@ -646,13 +770,20 @@ async fn run_candidate(
         response_json: run_dir.join("response.json"),
         result_json: run_dir.join("result.json"),
     };
-    let command = build_command(capabilities, metadata, &request.candidate, request.port);
+    let command = build_command(
+        capabilities,
+        metadata,
+        &request.candidate,
+        request.port,
+        request.probe_mode,
+    );
     let command_display = command_display(&command);
     write_shell_command(&artifacts.command, &command_display)?;
 
     let mut server = match LlamaServer::spawn(&command, &artifacts.server_log).await {
         Ok(server) => server,
         Err(err) => {
+            ensure_failure_artifacts(&artifacts)?;
             let ended_at = Utc::now();
             let result = empty_result(
                 metadata,
@@ -684,7 +815,7 @@ async fn run_candidate(
     let base_url = format!("http://127.0.0.1:{}/v1", request.port);
     let run_started = Instant::now();
     let drive_result = tokio::select! {
-        result = drive_probes(&base_url, metadata, &request) => result,
+        result = drive_probes_with_server(&base_url, metadata, &request, &mut server.child) => Ok(result),
         _ = tokio::signal::ctrl_c() => Err(anyhow!("interrupted by Ctrl-C")),
     };
 
@@ -697,8 +828,12 @@ async fn run_candidate(
     match drive_result {
         Ok(probe_output) => {
             probes = probe_output.probes;
-            request_artifact = probe_output.request_artifact;
-            response_artifact = probe_output.response_artifact;
+            request_artifact = json!({ "probes": probe_output.request_artifact });
+            response_artifact = json!({ "probes": probe_output.response_artifact });
+            if let Some(error) = probe_output.error {
+                note = error;
+                outcome = classify_probe_error(&note);
+            }
         }
         Err(err) => {
             note = err.to_string();
@@ -716,13 +851,18 @@ async fn run_candidate(
     let telemetry = sampler.stop().await;
     let ended_at = Utc::now();
     let log_text = fs::read_to_string(&artifacts.server_log).unwrap_or_default();
-    if outcome == Outcome::Pass && log_indicates_oom(&log_text) {
+    if !matches!(outcome, Outcome::Interrupted) && log_indicates_oom(&log_text) {
         outcome = Outcome::Oom;
         note = "server log contains OOM/CUDA allocation failure".to_string();
     }
 
     let timing = parse_llama_timings(&log_text);
     let mut metrics = crate::profile::RunMetrics::from(telemetry);
+    let telemetry_status = if metrics.min_free_vram_mib.is_some() {
+        TelemetryStatus::Measured
+    } else {
+        TelemetryStatus::Unknown
+    };
     metrics.server_prompt_eval_toks_per_s = timing.best_prompt_toks_per_s();
     metrics.server_generation_toks_per_s = timing.best_generation_toks_per_s();
     metrics.client_ttft_ms = probes
@@ -766,6 +906,7 @@ async fn run_candidate(
         ended_at,
         model_path: metadata.path.clone(),
         model_size_bytes: metadata.file_size_bytes,
+        model_identity: Some(metadata.model_identity()),
         gguf: metadata.clone(),
         quant: metadata.quant.clone(),
         command,
@@ -783,120 +924,197 @@ async fn run_candidate(
         environment: Some(environment.clone()),
         validation_level,
         compatibility: compare_environment(Some(&environment), &environment),
+        telemetry_status,
     };
     write_json(&result.artifacts.result_json, &result)?;
     Ok(result)
 }
 
-async fn drive_probes(
+async fn drive_probes_with_server(
     base_url: &str,
     metadata: &GgufMetadata,
     request: &RunRequest,
-) -> Result<ProbeOutput> {
-    wait_for_server(base_url).await?;
-    let mut probes = BTreeMap::new();
-    let mut request_artifact = Vec::new();
-    let mut response_artifact = Vec::new();
+    child: &mut Child,
+) -> ProbeOutput {
+    let mut output = ProbeOutput::default();
+    if let Err(err) = wait_for_server(base_url, child).await {
+        output.fail("startup", err);
+        return output;
+    }
 
     let sanity_prompt = "Reply with exactly the single character: K";
-    let sanity = post_chat_completion(
+    let sanity = post_chat_completion_with_mode(
         base_url,
         &metadata.display_name(),
         sanity_prompt,
         1,
         REQUEST_TIMEOUT,
+        request.probe_mode,
     )
-    .await
-    .context("sanity probe")?;
-    request_artifact.push(sanity.request_json.clone());
-    response_artifact.push(sanity.response_json.clone());
-    probes.insert("sanity".to_string(), sanity.summary);
+    .await;
+    let sanity = match sanity {
+        Ok(probe) => probe,
+        Err(err) => {
+            output.fail("sanity", err);
+            return output;
+        }
+    };
+    output.record("sanity", sanity);
 
-    match request.prompt_plan {
+    match &request.prompt_plan {
         PromptPlan::Tune {
             ingest_target_tokens,
             near_full_ingest_tokens,
         } => {
             let output_prompt =
                 "Write a concise checklist for safely profiling a local llama.cpp model.";
-            let output = post_chat_completion(
+            let output_probe = post_chat_completion_with_mode(
                 base_url,
                 &metadata.display_name(),
                 output_prompt,
                 128,
                 REQUEST_TIMEOUT,
+                request.probe_mode,
             )
-            .await
-            .context("output probe")?;
-            request_artifact.push(output.request_json.clone());
-            response_artifact.push(output.response_json.clone());
-            probes.insert("output".to_string(), output.summary);
+            .await;
+            let output_probe = match output_probe {
+                Ok(probe) => probe,
+                Err(err) => {
+                    output.fail("output", err);
+                    return output;
+                }
+            };
+            output.record("output", output_probe);
 
-            let (ingest_prompt, estimate) = repeated_license_prompt(ingest_target_tokens);
-            let ingest = post_chat_completion(
+            let (ingest_prompt, estimate) = repeated_license_prompt(*ingest_target_tokens);
+            let ingest = post_chat_completion_with_mode(
                 base_url,
                 &metadata.display_name(),
                 &ingest_prompt,
                 1,
                 REQUEST_TIMEOUT,
+                request.probe_mode,
             )
-            .await
-            .context("ingest probe")?;
+            .await;
+            let ingest = match ingest {
+                Ok(probe) => probe,
+                Err(err) => {
+                    output.fail("ingest", err);
+                    return output;
+                }
+            };
             let mut summary = ingest.summary;
             summary.prompt_tokens = Some(estimate);
-            request_artifact.push(ingest.request_json.clone());
-            response_artifact.push(ingest.response_json.clone());
-            probes.insert("ingest".to_string(), summary);
+            output.record_summary("ingest", summary, ingest.request_json, ingest.response_json);
 
             if let Some(target_tokens) = near_full_ingest_tokens {
-                let (prompt, estimate) = repeated_license_prompt(target_tokens);
-                let near_full = post_chat_completion(
+                let (prompt, estimate) = repeated_license_prompt(*target_tokens);
+                let near_full = post_chat_completion_with_mode(
                     base_url,
                     &metadata.display_name(),
                     &prompt,
                     1,
                     REQUEST_TIMEOUT,
+                    request.probe_mode,
                 )
-                .await
-                .context("near-full ingest probe")?;
+                .await;
+                let near_full = match near_full {
+                    Ok(probe) => probe,
+                    Err(err) => {
+                        output.fail("near_full_ingest", err);
+                        return output;
+                    }
+                };
                 let mut summary = near_full.summary;
                 summary.prompt_tokens = Some(estimate);
-                request_artifact.push(near_full.request_json.clone());
-                response_artifact.push(near_full.response_json.clone());
-                probes.insert("near_full_ingest".to_string(), summary);
+                output.record_summary(
+                    "near_full_ingest",
+                    summary,
+                    near_full.request_json,
+                    near_full.response_json,
+                );
             }
         }
         PromptPlan::FullCtx { target_tokens } => {
-            let (full_prompt, estimate) = repeated_license_prompt(target_tokens);
-            let fullctx = post_chat_completion(
+            let (full_prompt, estimate) = repeated_license_prompt(*target_tokens);
+            let fullctx = post_chat_completion_with_mode(
                 base_url,
                 &metadata.display_name(),
                 &full_prompt,
                 1,
                 REQUEST_TIMEOUT,
+                request.probe_mode,
             )
-            .await
-            .context("fullctx probe")?;
+            .await;
+            let fullctx = match fullctx {
+                Ok(probe) => probe,
+                Err(err) => {
+                    output.fail("fullctx", err);
+                    return output;
+                }
+            };
             let mut summary = fullctx.summary;
             summary.prompt_tokens = Some(estimate);
-            request_artifact.push(fullctx.request_json.clone());
-            response_artifact.push(fullctx.response_json.clone());
-            probes.insert("fullctx".to_string(), summary);
+            output.record_summary(
+                "fullctx",
+                summary,
+                fullctx.request_json,
+                fullctx.response_json,
+            );
         }
     }
 
-    Ok(ProbeOutput {
-        probes,
-        request_artifact: json!({ "probes": request_artifact }),
-        response_artifact: json!({ "probes": response_artifact }),
-    })
+    output
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct ProbeOutput {
     probes: BTreeMap<String, ProbeSummary>,
     request_artifact: serde_json::Value,
     response_artifact: serde_json::Value,
+    error: Option<String>,
+}
+
+impl ProbeOutput {
+    fn record(&mut self, name: &str, probe: ChatProbe) {
+        self.record_summary(name, probe.summary, probe.request_json, probe.response_json);
+    }
+
+    fn record_summary(
+        &mut self,
+        name: &str,
+        summary: ProbeSummary,
+        request: serde_json::Value,
+        response: serde_json::Value,
+    ) {
+        self.probes.insert(name.to_string(), summary);
+        self.request_values_mut().push(request);
+        self.response_values_mut().push(response);
+    }
+
+    fn fail(&mut self, name: &str, error: anyhow::Error) {
+        let message = format!("{name} probe: {error:#}");
+        self.error = Some(message.clone());
+        self.request_values_mut()
+            .push(json!({"probe": name, "error": &message}));
+        self.response_values_mut()
+            .push(json!({"probe": name, "error": message}));
+    }
+
+    fn request_values_mut(&mut self) -> &mut Vec<serde_json::Value> {
+        ensure_array(&mut self.request_artifact)
+    }
+
+    fn response_values_mut(&mut self) -> &mut Vec<serde_json::Value> {
+        ensure_array(&mut self.response_artifact)
+    }
+}
+
+fn ensure_array(value: &mut serde_json::Value) -> &mut Vec<serde_json::Value> {
+    if !value.is_array() {
+        *value = json!([]);
+    }
+    value.as_array_mut().expect("value was set to an array")
 }
 
 #[derive(Debug)]
@@ -913,9 +1131,43 @@ pub async fn post_chat_completion(
     max_tokens: u64,
     timeout: Duration,
 ) -> Result<ChatProbe> {
+    post_chat_completion_with_mode(
+        base_url,
+        model,
+        prompt,
+        max_tokens,
+        timeout,
+        ProbeMode::Thinking,
+    )
+    .await
+}
+
+pub async fn post_chat_completion_with_mode(
+    base_url: &str,
+    model: &str,
+    prompt: &str,
+    max_tokens: u64,
+    timeout: Duration,
+    probe_mode: ProbeMode,
+) -> Result<ChatProbe> {
+    tokio::time::timeout(
+        timeout,
+        post_chat_completion_inner(base_url, model, prompt, max_tokens, probe_mode),
+    )
+    .await
+    .context("chat request timed out")?
+}
+
+async fn post_chat_completion_inner(
+    base_url: &str,
+    model: &str,
+    prompt: &str,
+    max_tokens: u64,
+    probe_mode: ProbeMode,
+) -> Result<ChatProbe> {
     let client = reqwest::Client::new();
     let url = format!("{base_url}/chat/completions");
-    let payload = json!({
+    let mut payload = json!({
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
@@ -928,10 +1180,18 @@ pub async fn post_chat_completion(
         "chat_template_kwargs": {"enable_thinking": true},
         "stream": true
     });
+    if probe_mode == ProbeMode::Generic {
+        payload
+            .as_object_mut()
+            .expect("chat payload is an object")
+            .remove("chat_template_kwargs");
+    }
     let started = Instant::now();
-    let response = tokio::time::timeout(timeout, client.post(&url).json(&payload).send())
-        .await
-        .context("chat request timed out")??
+    let response = client
+        .post(&url)
+        .json(&payload)
+        .send()
+        .await?
         .error_for_status()
         .context("chat request failed")?;
 
@@ -1015,11 +1275,17 @@ pub fn drain_sse_events(buffer: &mut String) -> Vec<String> {
     events
 }
 
-async fn wait_for_server(base_url: &str) -> Result<()> {
+async fn wait_for_server(base_url: &str, child: &mut Child) -> Result<()> {
     let health = base_url.trim_end_matches("/v1").to_string();
     let client = reqwest::Client::new();
     let started = Instant::now();
     while started.elapsed() < STARTUP_TIMEOUT {
+        if let Some(status) = child
+            .try_wait()
+            .context("check llama-server startup status")?
+        {
+            bail!("llama-server exited before becoming healthy ({status})");
+        }
         let health_ok = client
             .get(format!("{health}/health"))
             .send()
@@ -1041,6 +1307,19 @@ async fn wait_for_server(base_url: &str) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     bail!("server startup timed out after {:?}", STARTUP_TIMEOUT);
+}
+
+fn classify_probe_error(note: &str) -> Outcome {
+    let lower = note.to_ascii_lowercase();
+    if lower.contains("interrupted") {
+        Outcome::Interrupted
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        Outcome::Timeout
+    } else if lower.contains("out of memory") || lower.contains("oom") {
+        Outcome::Oom
+    } else {
+        Outcome::ServerCrash
+    }
 }
 
 struct LlamaServer {
@@ -1136,6 +1415,7 @@ fn build_command(
     metadata: &GgufMetadata,
     candidate: &CandidateConfig,
     port: u16,
+    probe_mode: ProbeMode,
 ) -> Vec<String> {
     let mut args = vec![capabilities.executable.clone()];
     if capabilities.supports("--model") {
@@ -1169,13 +1449,13 @@ fn build_command(
     if capabilities.supports("-fa") {
         args.extend(["-fa".to_string(), "on".to_string()]);
     }
-    if capabilities.supports("--reasoning") {
+    if probe_mode == ProbeMode::Thinking && capabilities.supports("--reasoning") {
         args.extend(["--reasoning".to_string(), "on".to_string()]);
     }
-    if capabilities.supports("--reasoning-budget") {
+    if probe_mode == ProbeMode::Thinking && capabilities.supports("--reasoning-budget") {
         args.extend(["--reasoning-budget".to_string(), "4096".to_string()]);
     }
-    if capabilities.supports("--chat-template-kwargs") {
+    if probe_mode == ProbeMode::Thinking && capabilities.supports("--chat-template-kwargs") {
         args.extend([
             "--chat-template-kwargs".to_string(),
             "{\"enable_thinking\":true}".to_string(),
@@ -1199,7 +1479,7 @@ fn build_command(
     if capabilities.supports("--repeat-penalty") {
         args.extend(["--repeat-penalty".to_string(), "1.0".to_string()]);
     }
-    if capabilities.supports("--reasoning-budget-message") {
+    if probe_mode == ProbeMode::Thinking && capabilities.supports("--reasoning-budget-message") {
         args.extend([
             "--reasoning-budget-message".to_string(),
             THINKING_BUDGET_MESSAGE.to_string(),
@@ -1268,6 +1548,7 @@ fn empty_result(metadata: &GgufMetadata, failed: FailedRun) -> ProfileResult {
         ended_at: failed.ended_at,
         model_path: metadata.path.clone(),
         model_size_bytes: metadata.file_size_bytes,
+        model_identity: Some(metadata.model_identity()),
         gguf: metadata.clone(),
         quant: metadata.quant.clone(),
         command: failed.command,
@@ -1285,6 +1566,7 @@ fn empty_result(metadata: &GgufMetadata, failed: FailedRun) -> ProfileResult {
         environment: Some(failed.environment.clone()),
         validation_level: failed.validation_level,
         compatibility: compare_environment(Some(&failed.environment), &failed.environment),
+        telemetry_status: TelemetryStatus::Unknown,
     }
 }
 
@@ -1330,6 +1612,23 @@ fn write_json(path: impl AsRef<Path>, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
+fn ensure_failure_artifacts(artifacts: &ArtifactPaths) -> Result<()> {
+    for path in [
+        &artifacts.server_log,
+        &artifacts.telemetry_jsonl,
+        &artifacts.request_json,
+        &artifacts.response_json,
+    ] {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if !path.exists() {
+            fs::File::create(path)?;
+        }
+    }
+    Ok(())
+}
+
 fn write_manifest(metadata: &GgufMetadata) -> Result<()> {
     let profiler_dir = metadata.profiler_dir();
     let runs = load_prior_results(&profiler_dir)?
@@ -1340,6 +1639,7 @@ fn write_manifest(metadata: &GgufMetadata) -> Result<()> {
         schema_version: SCHEMA_VERSION,
         generated_at: Utc::now(),
         model_path: metadata.path.clone(),
+        model_identity: metadata.model_identity(),
         gguf: metadata.clone(),
         runs,
     };
@@ -1377,11 +1677,17 @@ fn load_recommendations(profiler_dir: &Path) -> Result<RecommendationFile> {
 fn candidate_for_saved_profile(
     metadata: &GgufMetadata,
     profile_id: &str,
+    current_environment: &EnvironmentSnapshot,
 ) -> Result<Option<CandidateConfig>> {
     let recs = match load_recommendations(&metadata.profiler_dir()) {
         Ok(recs) => recs,
         Err(_) => return Ok(None),
     };
+    if recs.model_identity.as_ref() != Some(&metadata.model_identity())
+        || !compare_environment(recs.environment.as_ref(), current_environment).is_current()
+    {
+        return Ok(None);
+    }
     let Some(profile) = recs
         .profiles
         .iter()
@@ -1561,18 +1867,44 @@ pub fn model_key_for_opencode(metadata: &GgufMetadata, profile_id: &str) -> Stri
 
 pub fn collect_profiled_models(root: &Path) -> Result<Vec<(GgufMetadata, RecommendationFile)>> {
     let mut found = Vec::new();
-    collect_recommendation_dirs(root, &mut found)?;
+    if root.is_file() {
+        let metadata = read_metadata(root)?;
+        for directory in [metadata.profiler_dir(), metadata.legacy_profiler_dir()] {
+            let recommendation = directory.join("recommendations.json");
+            if recommendation.exists() {
+                found.push(recommendation);
+            }
+        }
+    } else {
+        collect_recommendation_dirs(root, &mut found)?;
+    }
+    found.sort_by_key(|path| {
+        if path
+            .components()
+            .any(|component| component.as_os_str() == OsStr::new("models"))
+        {
+            0
+        } else {
+            1
+        }
+    });
     let mut output = Vec::new();
     let mut seen = BTreeSet::new();
+    let current_environment = current_environment_best_effort();
     for rec_path in found {
         let data = fs::read_to_string(&rec_path)?;
         let recs: RecommendationFile = serde_json::from_str(&data)?;
-        if !seen.insert(recs.model_path.clone()) {
+        let model_key =
+            fs::canonicalize(&recs.model_path).unwrap_or_else(|_| recs.model_path.clone());
+        if !seen.insert(model_key) {
             continue;
         }
         if recs.model_path.exists() {
             let metadata = read_metadata(&recs.model_path)?;
-            output.push((metadata, recs));
+            output.push((
+                metadata.clone(),
+                validate_recommendation_file(&metadata, &recs, &current_environment),
+            ));
         }
     }
     Ok(output)
@@ -1587,13 +1919,23 @@ fn collect_recommendation_dirs(root: &Path, found: &mut Vec<PathBuf>) -> Result<
         let path = entry.path();
         if path.is_dir() {
             if path.file_name() == Some(OsStr::new(".llama-cpp-profiler")) {
-                let rec = path.join("recommendations.json");
-                if rec.exists() {
-                    found.push(rec);
-                }
+                collect_recommendation_files(&path, found)?;
                 continue;
             }
             collect_recommendation_dirs(&path, found)?;
+        }
+    }
+    Ok(())
+}
+
+fn collect_recommendation_files(root: &Path, found: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_recommendation_files(&path, found)?;
+        } else if path.file_name() == Some(OsStr::new("recommendations.json")) {
+            found.push(path);
         }
     }
     Ok(())
@@ -1651,6 +1993,90 @@ llama_perf_context_print:        prompt eval time =   1000.00 ms / 16000 tokens 
         ];
         let updated = command_with_port(&command, 18080);
         assert_eq!(updated[2], "18080");
+    }
+
+    #[test]
+    fn generic_command_omits_thinking_arguments() {
+        let capabilities = ServerCapabilities {
+            executable: "llama-server".to_string(),
+            help: "--model --host --port -c --reasoning --reasoning-budget --chat-template-kwargs --reasoning-budget-message --temp --top-p".to_string(),
+        };
+        let metadata = GgufMetadata {
+            path: PathBuf::from("/models/test.gguf"),
+            file_name: "test.gguf".to_string(),
+            file_size_bytes: 1,
+            gguf_version: 3,
+            tensor_count: 0,
+            metadata_kv_count: 0,
+            name: None,
+            architecture: Some("llama".to_string()),
+            size_label: None,
+            native_context: Some(4096),
+            block_count: Some(1),
+            expert_count: None,
+            expert_used_count: None,
+            tokenizer_has_chat_template: true,
+            quant: None,
+            file_type: None,
+            model_kind: crate::gguf::ModelKind::Dense,
+            metadata: BTreeMap::new(),
+        };
+        let candidate = test_candidate("dense", 1024, 256, 1536);
+        let generic = build_command(
+            &capabilities,
+            &metadata,
+            &candidate,
+            18080,
+            ProbeMode::Generic,
+        );
+        let thinking = build_command(
+            &capabilities,
+            &metadata,
+            &candidate,
+            18080,
+            ProbeMode::Thinking,
+        );
+        assert!(!generic.iter().any(|part| part == "--reasoning"));
+        assert!(!generic.iter().any(|part| part == "--chat-template-kwargs"));
+        assert!(thinking.iter().any(|part| part == "--reasoning"));
+    }
+
+    #[tokio::test]
+    async fn startup_exit_is_reported_without_waiting_for_startup_timeout() {
+        let mut child = Command::new("sh").args(["-c", "exit 7"]).spawn().unwrap();
+        let error = wait_for_server("http://127.0.0.1:1/v1", &mut child)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exited before becoming healthy"));
+    }
+
+    #[tokio::test]
+    async fn streaming_body_stall_is_covered_by_probe_timeout() {
+        use std::io::{Read, Write};
+        use std::thread;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 100\r\nConnection: keep-alive\r\n\r\n")
+                .unwrap();
+            thread::sleep(Duration::from_millis(200));
+        });
+        let error = post_chat_completion(
+            &format!("http://127.0.0.1:{port}/v1"),
+            "fake",
+            "stall",
+            1,
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        handle.join().unwrap();
+        assert!(error.to_string().contains("timed out"));
     }
 
     #[test]
@@ -1754,6 +2180,7 @@ llama_perf_context_print:        prompt eval time =   1000.00 ms / 16000 tokens 
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn e2e_tune_recommendations_and_serve_print_with_fake_server() {
         let _guard = env_lock().lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
@@ -1778,6 +2205,7 @@ llama_perf_context_print:        prompt eval time =   1000.00 ms / 16000 tokens 
                 plan_only: false,
                 near_full_ingest: false,
                 near_full_target_tokens: None,
+                probe_mode: ProbeMode::Thinking,
             },
         )
         .await
@@ -1791,10 +2219,9 @@ llama_perf_context_print:        prompt eval time =   1000.00 ms / 16000 tokens 
                 .iter()
                 .any(|profile| profile.id == "interactive-fast")
         );
-        let result_path = model_path
-            .parent()
+        let result_path = read_metadata(&model_path)
             .unwrap()
-            .join(".llama-cpp-profiler")
+            .profiler_dir()
             .join("runs")
             .join(&recs.profiles[0].source_run_id)
             .join("result.json");
@@ -1818,6 +2245,30 @@ llama_perf_context_print:        prompt eval time =   1000.00 ms / 16000 tokens 
         )
         .await
         .unwrap();
+
+        use std::io::Write;
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&model_path)
+            .unwrap()
+            .write_all(b"changed")
+            .unwrap();
+        let stale_error = run_serve(
+            &model_path,
+            ServeOptions {
+                profile: "interactive-fast".to_string(),
+                port: 28_080,
+                print_only: true,
+                allow_stale: false,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            stale_error
+                .to_string()
+                .contains("model at this path changed")
+        );
         unsafe {
             std::env::remove_var("LLAMA_SERVER");
         }
@@ -1872,6 +2323,7 @@ llama_perf_context_print:        prompt eval time =   1000.00 ms / 16000 tokens 
             ended_at: Utc::now(),
             model_path: gguf.path.clone(),
             model_size_bytes: gguf.file_size_bytes,
+            model_identity: Some(gguf.model_identity()),
             gguf: gguf.clone(),
             quant: gguf.quant.clone(),
             command: vec!["llama-server".to_string()],
@@ -1899,6 +2351,7 @@ llama_perf_context_print:        prompt eval time =   1000.00 ms / 16000 tokens 
             environment: None,
             validation_level: ValidationLevel::Smoke,
             compatibility: crate::environment::Compatibility::Current,
+            telemetry_status: TelemetryStatus::Measured,
         }
     }
 

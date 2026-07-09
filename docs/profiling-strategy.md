@@ -20,7 +20,8 @@ The profiler records evidence that applies to any `llama-server` client:
 
 Client harnesses such as opencode are not part of the core scoring model. They
 can be exported as labels that point at the server endpoint, but the running
-`llama-server` process determines the actual GGUF and runtime config.
+`llama-server` process determines the actual GGUF and runtime config. Opencode
+is an optional adapter and receives the profile's validated context.
 
 Recommendations are environment-bound. If the OS/architecture, CPU identity or
 core count, RAM/swap totals, GPU backend, GPU inventory/driver, or
@@ -44,7 +45,8 @@ Candidate planning uses the current environment snapshot to keep likely-safe
 candidates ahead of aggressive ones. The risk heuristic compares model size plus
 an approximate KV-cache footprint against total detected VRAM; if VRAM is not
 available, the conservative default order is preserved. The first candidates use
-the model's native context length, capped by `--ctx`. Lower-context fallbacks are
+the model's native context length, capped by an explicit `--ctx` when supplied.
+Lower-context fallbacks are
 kept later in the queue. During `tune`, passed runs with at least 2 GiB free VRAM
 can promote more aggressive already-planned candidates, while OOM, timeout,
 crash, or too-tight runs can promote safer already-planned candidates, including
@@ -73,7 +75,8 @@ evidence: future agents should not retry the same aggressive settings blindly.
 
 ## Probe Set
 
-`tune` uses bounded probes:
+Plain `tune` defaults to the bounded `quick` preset and never adds a near-full
+context probe automatically. Its probes are:
 
 - `sanity`: tiny answer, `max_tokens = 1`.
 - `output`: small prompt, 128 generated tokens.
@@ -98,6 +101,9 @@ generation uses `/usr/share/licenses/spdx/Apache-2.0.txt` when available, with a
 bundled Apache-2.0 fixture as fallback, so runs are deterministic and independent
 of network access.
 
+Thinking mode is the default probe behavior and includes reasoning-specific
+server/request settings. `--probe-mode generic` omits those settings.
+
 ## Scoring
 
 Profiles are selected from observed runs that pass safety limits:
@@ -106,7 +112,6 @@ Profiles are selected from observed runs that pass safety limits:
 - `interactive-safe`: maximize generation speed with at least 1 GiB free VRAM.
 - `prompt-replay`: maximize prompt ingest speed.
 - `balanced`: maximize harmonic mean of generation and prompt ingest speed.
-- `quality-night`: use quant tier only as a rough quality proxy, clearly labeled.
 
 Rejected runs keep a compact reason: OOM, timeout, server crash, too-tight VRAM
 or swap use, interrupted, or parse-partial, with the first failure note line when
@@ -114,5 +119,8 @@ available. `parse-partial` is still usable for recommendation scoring when it
 passes safety limits because the request completed but one or more llama.cpp
 timing lines were missing.
 
-Legacy or changed-environment runs are listed separately as stale. They are not
-used for scoring unless a future command explicitly opts into diagnostic display.
+Legacy, changed-model, or changed-environment runs are listed separately as
+stale. They are never used for scoring. Missing NVIDIA telemetry leaves safety
+unknown; such profiles may be ranked for speed but cannot be `interactive-safe`.
+This beta supports Linux and `llama-server`; multi-GPU placement and non-NVIDIA
+backend optimization remain limited or deferred.

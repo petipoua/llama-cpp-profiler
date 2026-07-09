@@ -1,5 +1,5 @@
 use crate::gguf::{GgufMetadata, discover_models, format_bytes};
-use crate::profile::{Recommendation, RecommendationFile};
+use crate::profile::{AGENT_SCHEMA_VERSION, Recommendation, RecommendationFile, TelemetryStatus};
 use crate::runner::{collect_profiled_models, model_key_for_opencode, model_label_for_opencode};
 use anyhow::{Context, Result, bail};
 use comfy_table::{Cell, Table, presets::UTF8_FULL_CONDENSED};
@@ -27,6 +27,7 @@ pub struct ExportOptions {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AgentReport {
+    agent_schema_version: u32,
     schema_version: u32,
     best_profile_ids: Vec<String>,
     exact_command: Option<String>,
@@ -40,6 +41,9 @@ struct AgentReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AgentMetric {
     model_path: PathBuf,
+    model_identity: Option<crate::gguf::ModelIdentity>,
+    environment_valid: bool,
+    telemetry_status: TelemetryStatus,
     model_kind: crate::gguf::ModelKind,
     quant: Option<String>,
     native_context: Option<u64>,
@@ -98,6 +102,57 @@ pub fn print_report(root: &Path, options: ReportOptions) -> Result<()> {
         }
     }
     println!("{table}");
+    for (metadata, recs) in &profiled {
+        if !recs.profiles.is_empty() {
+            let validated_contexts = recs
+                .profiles
+                .iter()
+                .map(|profile| profile.requested_context.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let validated_prompts = recs
+                .profiles
+                .iter()
+                .filter_map(|profile| profile.validated_prompt_tokens)
+                .map(|tokens| tokens.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "{} native context: {}; validated server context: {}; validated prompt tokens: {}; telemetry: {}",
+                metadata.file_name,
+                metadata
+                    .native_context
+                    .map_or_else(|| "unknown".to_string(), |v| v.to_string()),
+                validated_contexts,
+                if validated_prompts.is_empty() {
+                    "unknown"
+                } else {
+                    &validated_prompts
+                },
+                if recs
+                    .profiles
+                    .iter()
+                    .any(|profile| profile.telemetry_status == TelemetryStatus::Measured)
+                {
+                    "measured"
+                } else {
+                    "unknown; safety not validated"
+                },
+            );
+        }
+        if !recs.rejected.is_empty() {
+            println!("\n{} rejected runs:", metadata.file_name);
+            for rejected in recs.rejected.iter().take(12) {
+                println!(
+                    "  {} / {}: {:?} - {}",
+                    rejected.run_id, rejected.candidate_id, rejected.outcome, rejected.reason
+                );
+            }
+        }
+        if let Some(next) = &recs.next_suggested_test {
+            println!("{} next: {next}", metadata.file_name);
+        }
+    }
     Ok(())
 }
 
@@ -162,6 +217,7 @@ pub fn inspect_model(path: &Path) -> Result<Value> {
         "expert_count": metadata.expert_count,
         "expert_used_count": metadata.expert_used_count,
         "tokenizer_has_chat_template": metadata.tokenizer_has_chat_template,
+        "model_identity": metadata.model_identity(),
         "prior_run_count": run_count,
         "recommendations": recommendations,
     }))
@@ -358,6 +414,9 @@ fn print_agent_report(profiled: &[(GgufMetadata, RecommendationFile)]) -> Result
         .take(8)
         .map(|(metadata, profile)| AgentMetric {
             model_path: metadata.path.clone(),
+            model_identity: profile.model_identity.clone(),
+            environment_valid: profile.environment_valid,
+            telemetry_status: profile.telemetry_status,
             model_kind: metadata.model_kind.clone(),
             quant: metadata.quant.clone(),
             native_context: metadata.native_context,
@@ -381,6 +440,7 @@ fn print_agent_report(profiled: &[(GgufMetadata, RecommendationFile)]) -> Result
         })
         .collect();
     let report = AgentReport {
+        agent_schema_version: AGENT_SCHEMA_VERSION,
         schema_version: crate::profile::SCHEMA_VERSION,
         best_profile_ids,
         exact_command,
@@ -435,16 +495,7 @@ fn export_opencode(
     profiled: &[(GgufMetadata, RecommendationFile)],
     dry_run: bool,
 ) -> Result<()> {
-    let mut entries = Vec::new();
-    for (metadata, recs) in profiled {
-        for profile in &recs.profiles {
-            entries.push((
-                model_key_for_opencode(metadata, &profile.id),
-                model_label_for_opencode(metadata, &profile.id),
-                metadata.native_context.unwrap_or(262_144),
-            ));
-        }
-    }
+    let entries = opencode_entries(profiled);
     let existing = fs::read_to_string(path).unwrap_or_else(|_| "{}".to_string());
     let updated = update_opencode_json(&existing, &entries)?;
     if dry_run {
@@ -454,6 +505,21 @@ fn export_opencode(
         println!("updated {}", path.display());
     }
     Ok(())
+}
+
+fn opencode_entries(profiled: &[(GgufMetadata, RecommendationFile)]) -> Vec<(String, String, u64)> {
+    profiled
+        .iter()
+        .flat_map(|(metadata, recs)| {
+            recs.profiles.iter().map(|profile| {
+                (
+                    model_key_for_opencode(metadata, &profile.id),
+                    model_label_for_opencode(metadata, &profile.id),
+                    profile.requested_context,
+                )
+            })
+        })
+        .collect()
 }
 
 fn markdown_block(profiled: &[(GgufMetadata, RecommendationFile)]) -> String {
@@ -665,5 +731,67 @@ mod tests {
             value.pointer("/permission/*").and_then(Value::as_str),
             Some("allow")
         );
+    }
+
+    #[test]
+    fn opencode_entries_use_validated_profile_context() {
+        let metadata = GgufMetadata {
+            path: PathBuf::from("/models/test.gguf"),
+            file_name: "test.gguf".to_string(),
+            file_size_bytes: 1,
+            gguf_version: 3,
+            tensor_count: 0,
+            metadata_kv_count: 0,
+            name: Some("Test".to_string()),
+            architecture: Some("llama".to_string()),
+            size_label: None,
+            native_context: Some(262_144),
+            block_count: Some(1),
+            expert_count: None,
+            expert_used_count: None,
+            tokenizer_has_chat_template: true,
+            quant: Some("Q4_K_M".to_string()),
+            file_type: None,
+            model_kind: crate::gguf::ModelKind::Dense,
+            metadata: std::collections::BTreeMap::new(),
+        };
+        let profile = Recommendation {
+            id: "interactive-fast".to_string(),
+            role: "fast".to_string(),
+            source_run_id: "run".to_string(),
+            source_candidate_id: "candidate".to_string(),
+            source_test_kind: "tune".to_string(),
+            model_identity: None,
+            requested_context: 8192,
+            validated_prompt_tokens: Some(7000),
+            validation_level: crate::profile::ValidationLevel::Smoke,
+            compatibility: crate::environment::Compatibility::Current,
+            environment_valid: true,
+            telemetry_status: TelemetryStatus::Measured,
+            stale_reason: None,
+            command: vec!["llama-server".to_string()],
+            command_display: "llama-server".to_string(),
+            output_toks_per_s: Some(1.0),
+            prompt_toks_per_s: Some(1.0),
+            ttft_ms: Some(1),
+            peak_vram_mib: Some(1),
+            headroom_mib: Some(1),
+            risk: "low".to_string(),
+            note: String::new(),
+        };
+        let recommendations = RecommendationFile {
+            schema_version: crate::profile::SCHEMA_VERSION,
+            generated_at: chrono::Utc::now(),
+            model_path: metadata.path.clone(),
+            model_identity: None,
+            profiles: vec![profile],
+            rejected: Vec::new(),
+            stale: Vec::new(),
+            environment: None,
+            environment_valid: false,
+            next_suggested_test: None,
+        };
+        let entries = opencode_entries(&[(metadata, recommendations)]);
+        assert_eq!(entries[0].2, 8192);
     }
 }

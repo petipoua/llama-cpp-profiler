@@ -1,9 +1,9 @@
 # Data Schemas
 
-The schemas are versioned by `schema_version`. Version `2` adds environment
-snapshots, compatibility status, validation levels, and richer agent metadata.
-Version `1` result files are read best-effort and treated as legacy stale runs
-because they do not contain environment snapshots.
+The schemas are versioned by `schema_version`. Beta schema version `3` adds
+versioned model identity and validation fields. Version `1` and `2` files are
+read best-effort, retained as evidence, and treated as legacy stale runs when
+they lack model identity.
 
 ## `result.json`
 
@@ -15,6 +15,8 @@ Important fields:
 - `run_id`: timestamp plus candidate id.
 - `started_at`, `ended_at`: UTC timestamps.
 - `model_path`, `model_size_bytes`: profiled GGUF identity.
+- `model_identity`: version, canonical path, file size, modification time, and a
+  stable hash of parsed GGUF metadata. Results without it are legacy/stale.
 - `gguf`: parsed GGUF metadata, including architecture, native context, quant, MoE expert counts, and chat-template presence.
 - `command`: argv array used to launch `llama-server`.
 - `command_display`: shell-escaped command string.
@@ -26,7 +28,9 @@ Important fields:
 - `requested_context`: context passed to the server.
 - `validation_level`: serialized as `smoke`, `standard_ingest`, or `fullctx`; reports display `standard_ingest` as `standard-ingest`.
 - `environment`: profiler, OS/architecture, CPU, memory, GPU, and `llama-server` snapshot.
-- `compatibility`: `current`, `legacy_missing_snapshot`, `server_changed`, or `hardware_changed`.
+- `compatibility`: environment validation (`current`, `legacy_missing_snapshot`,
+  `server_changed`, or `hardware_changed`). Stale records may additionally use
+  `legacy_missing_identity` or `model_changed` when model validation fails.
 - `prompt_tokens`, `completion_tokens`: best available token counts, preferring server timing lines.
 - `metrics.server_prompt_eval_toks_per_s`: parsed from llama.cpp `prompt eval time`.
 - `metrics.server_generation_toks_per_s`: parsed from llama.cpp `eval time`.
@@ -35,6 +39,8 @@ Important fields:
 - `metrics.peak_vram_mib`, `metrics.min_free_vram_mib`: sampled with `nvidia-smi`.
 - `metrics.gpu_util_avg_pct`, `metrics.gpu_util_max_pct`: sampled GPU utilization.
 - `metrics.ram_available_min_mib`, `metrics.swap_delta_mib`, `metrics.process_rss_peak_mib`, `metrics.cpu_util_avg_pct`: system/process telemetry.
+- `telemetry_status`: `measured` or `unknown`. Missing NVIDIA telemetry never
+  receives a low-risk label and cannot qualify for `interactive-safe`.
 - `probes`: per-probe summaries for `sanity`, `output`, `ingest`,
   `near_full_ingest`, or `fullctx`. `tune` runs `sanity`, `output`, and
   `ingest`; `tune --near-full-ingest` and `recommend --near-full-ingest` also
@@ -52,23 +58,27 @@ Important fields:
 - `schema_version`
 - `generated_at`
 - `model_path`
+- `model_identity`
 - `profiles`: ranked profile recommendations.
 - `rejected`: failed, OOM, timeout, swap-heavy, or too-tight candidate summaries.
 - `stale`: legacy or changed-environment run summaries excluded from ranking.
 - `environment`: current environment used when rebuilding recommendations.
+- `environment_valid`: whether the saved environment still matches the current
+  environment during report/serve validation.
 - `next_suggested_test`: a compact next action for future agents.
 
 Each profile contains:
 
-- `id`: `interactive-fast`, `interactive-safe`, `prompt-replay`, `balanced`, or `quality-night`.
+- `id`: `interactive-fast`, `interactive-safe`, `prompt-replay`, or `balanced`.
 - `role`: human-readable role.
 - `source_run_id`: run that produced the profile.
 - `source_candidate_id`, `source_test_kind`, `requested_context`
 - `validated_prompt_tokens`, `validation_level`, `compatibility`
+- `model_identity`, `environment_valid`, `telemetry_status`
 - `command`, `command_display`: exact `llama-server` command.
 - `output_toks_per_s`, `prompt_toks_per_s`, `ttft_ms`
 - `peak_vram_mib`, `headroom_mib`
-- `risk`: `low`, `medium`, or `high`.
+- `risk`: `low`, `medium`, `high`, or `unknown` when VRAM was not measured.
 - `note`
 
 Profile ids may point at the same source run when one candidate is best for
@@ -83,7 +93,8 @@ Markdown reports put the comparison table first:
 | Profile | Role | Output tok/s | Prompt tok/s | TTFT | Peak VRAM | Headroom | Risk | Validation | Command |
 |---|---|---:|---:|---:|---:|---:|---|---|---|
 
-`report --agent` prints one compact JSON object:
+`report --agent` prints one compact JSON object. `agent_schema_version` is the
+stable contract version, separate from the profiler `schema_version`:
 
 - `best_profile_ids`: unambiguous `model-path#profile` keys.
 - `exact_command`
@@ -92,6 +103,8 @@ Markdown reports put the comparison table first:
 - `failures`
 - `stale_profiles`
 - `next_suggested_test`
+- each metric also includes model identity, environment validity, telemetry
+  status, risk, validation level, metrics, failures, and exact command.
 
 Each metric includes model path, `profile_key`, profile id, source run id, source
 candidate id, model kind, quant, native context, test kind, requested context,
@@ -106,10 +119,12 @@ This is the main interface for future agents that need a quick, low-token answer
 profile:
 
 - `model_path`
+- `agent_schema_version`, `schema_version`, `model_identity`
 - `profile_id`
 - `profile_key`
 - `confidence`
 - `command`
+- `exact_command`, `environment_valid`, `telemetry_status`, `risk`, `failures`, `stale`
 - `output_toks_per_s`, `prompt_toks_per_s`, `ttft_ms`
 - `requested_context`, `validated_prompt_tokens`, `validation_level`
 - `next_suggested_test`

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail};
+use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -16,6 +17,18 @@ pub enum ModelKind {
     Moe,
     Unknown,
 }
+
+/// The on-disk identity used to keep profiler evidence tied to one exact GGUF.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelIdentity {
+    pub version: u32,
+    pub canonical_path: PathBuf,
+    pub file_size_bytes: u64,
+    pub modified_at: Option<DateTime<Utc>>,
+    pub metadata_hash: String,
+}
+
+pub const MODEL_IDENTITY_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
@@ -66,11 +79,58 @@ impl GgufMetadata {
     }
 
     pub fn profiler_dir(&self) -> PathBuf {
-        self.path
+        self.model_identity()
+            .canonical_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(".llama-cpp-profiler")
+            .join("models")
+            .join(stable_hash(
+                &self.model_identity().canonical_path.to_string_lossy(),
+            ))
+    }
+
+    /// The pre-beta state location. It is intentionally only used for
+    /// diagnostics/legacy discovery, never for new writes or scoring.
+    pub fn legacy_profiler_dir(&self) -> PathBuf {
+        self.model_identity()
+            .canonical_path
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join(".llama-cpp-profiler")
     }
+
+    pub fn model_identity(&self) -> ModelIdentity {
+        let canonical_path =
+            std::fs::canonicalize(&self.path).unwrap_or_else(|_| self.path.clone());
+        let modified_at = std::fs::metadata(&self.path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .map(DateTime::<Utc>::from);
+        let metadata_hash = serde_json::to_vec(&self.metadata)
+            .map(|bytes| stable_hash_bytes(&bytes))
+            .unwrap_or_else(|_| stable_hash(&format!("{:?}", self.metadata)));
+        ModelIdentity {
+            version: MODEL_IDENTITY_VERSION,
+            canonical_path,
+            file_size_bytes: self.file_size_bytes,
+            modified_at,
+            metadata_hash,
+        }
+    }
+}
+
+fn stable_hash(value: &str) -> String {
+    stable_hash_bytes(value.as_bytes())
+}
+
+fn stable_hash_bytes(value: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in value {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,7 +185,7 @@ pub fn resolve_model_path(path: impl AsRef<Path>) -> Result<PathBuf> {
     let path = path.as_ref();
     if path.is_file() {
         if is_model_gguf(path) {
-            return Ok(path.to_path_buf());
+            return Ok(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()));
         }
         bail!("not a model GGUF: {}", path.display());
     }
@@ -145,11 +205,14 @@ pub fn resolve_model_path(path: impl AsRef<Path>) -> Result<PathBuf> {
             .map(|metadata| std::cmp::Reverse(metadata.len()))
             .unwrap_or(std::cmp::Reverse(0))
     });
-    Ok(files.remove(0))
+    let selected = files.remove(0);
+    Ok(std::fs::canonicalize(&selected).unwrap_or(selected))
 }
 
 pub fn read_metadata(path: impl AsRef<Path>) -> Result<GgufMetadata> {
     let path = path.as_ref();
+    let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let path = canonical_path.as_path();
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let file_size_bytes = file
         .metadata()
@@ -530,6 +593,55 @@ mod tests {
         assert_eq!(metadata.quant.as_deref(), Some("Q4_K_M"));
         assert_eq!(metadata.model_kind, ModelKind::Moe);
         assert!(metadata.tokenizer_has_chat_template);
+    }
+
+    #[test]
+    fn profiler_state_isolated_for_models_in_one_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.gguf");
+        let second = directory.path().join("second.gguf");
+        write_test_gguf(&first, "first", 4096);
+        write_test_gguf(&second, "second", 8192);
+
+        let first_metadata = read_metadata(&first).unwrap();
+        let second_metadata = read_metadata(&second).unwrap();
+        assert_ne!(
+            first_metadata.profiler_dir(),
+            second_metadata.profiler_dir()
+        );
+        assert!(
+            first_metadata
+                .profiler_dir()
+                .parent()
+                .unwrap()
+                .ends_with("models")
+        );
+        assert_eq!(
+            first_metadata.model_identity().canonical_path,
+            std::fs::canonicalize(first).unwrap()
+        );
+    }
+
+    fn write_test_gguf(path: &Path, name: &str, context: u32) {
+        let mut file = File::create(path).unwrap();
+        file.write_all(b"GGUF").unwrap();
+        file.write_all(&3u32.to_le_bytes()).unwrap();
+        file.write_all(&0u64.to_le_bytes()).unwrap();
+        file.write_all(&3u64.to_le_bytes()).unwrap();
+        write_identity_key(&mut file, "general.architecture", 8);
+        file.write_all(&(name.len() as u64).to_le_bytes()).unwrap();
+        file.write_all(name.as_bytes()).unwrap();
+        write_identity_key(&mut file, "general.name", 8);
+        file.write_all(&(name.len() as u64).to_le_bytes()).unwrap();
+        file.write_all(name.as_bytes()).unwrap();
+        write_identity_key(&mut file, "llama.context_length", 4);
+        file.write_all(&context.to_le_bytes()).unwrap();
+    }
+
+    fn write_identity_key(file: &mut File, key: &str, kind: u32) {
+        file.write_all(&(key.len() as u64).to_le_bytes()).unwrap();
+        file.write_all(key.as_bytes()).unwrap();
+        file.write_all(&kind.to_le_bytes()).unwrap();
     }
 
     fn write_key(file: &mut tempfile::NamedTempFile, key: &str, kind: u32) {

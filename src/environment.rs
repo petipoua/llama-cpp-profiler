@@ -68,8 +68,10 @@ pub enum Compatibility {
     Current,
     #[default]
     LegacyMissingSnapshot,
+    LegacyMissingIdentity,
     ServerChanged,
     HardwareChanged,
+    ModelChanged,
 }
 
 impl Compatibility {
@@ -81,8 +83,10 @@ impl Compatibility {
         match self {
             Self::Current => "current environment",
             Self::LegacyMissingSnapshot => "legacy run is missing environment snapshot",
+            Self::LegacyMissingIdentity => "legacy run is missing model identity",
             Self::ServerChanged => "llama-server executable or help output changed",
             Self::HardwareChanged => "hardware or driver changed",
+            Self::ModelChanged => "model at this path changed",
         }
     }
 }

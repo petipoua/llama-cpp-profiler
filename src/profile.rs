@@ -1,5 +1,5 @@
 use crate::environment::{Compatibility, EnvironmentSnapshot, compare_environment};
-use crate::gguf::{GgufMetadata, ModelKind};
+use crate::gguf::{GgufMetadata, ModelIdentity, ModelKind, read_metadata};
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -8,7 +8,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
+pub const AGENT_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -99,6 +100,14 @@ pub enum ValidationLevel {
     Fullctx,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TelemetryStatus {
+    Measured,
+    #[default]
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {
@@ -160,6 +169,8 @@ pub struct ProfileResult {
     pub ended_at: DateTime<Utc>,
     pub model_path: PathBuf,
     pub model_size_bytes: u64,
+    #[serde(default)]
+    pub model_identity: Option<ModelIdentity>,
     pub gguf: GgufMetadata,
     pub quant: Option<String>,
     pub command: Vec<String>,
@@ -180,6 +191,8 @@ pub struct ProfileResult {
     pub validation_level: ValidationLevel,
     #[serde(default)]
     pub compatibility: Compatibility,
+    #[serde(default)]
+    pub telemetry_status: TelemetryStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -187,6 +200,7 @@ pub struct Manifest {
     pub schema_version: u32,
     pub generated_at: DateTime<Utc>,
     pub model_path: PathBuf,
+    pub model_identity: ModelIdentity,
     pub gguf: GgufMetadata,
     pub runs: Vec<PathBuf>,
 }
@@ -196,12 +210,16 @@ pub struct RecommendationFile {
     pub schema_version: u32,
     pub generated_at: DateTime<Utc>,
     pub model_path: PathBuf,
+    #[serde(default)]
+    pub model_identity: Option<ModelIdentity>,
     pub profiles: Vec<Recommendation>,
     pub rejected: Vec<RejectedRun>,
     #[serde(default)]
     pub stale: Vec<StaleRun>,
     #[serde(default)]
     pub environment: Option<EnvironmentSnapshot>,
+    #[serde(default)]
+    pub environment_valid: bool,
     pub next_suggested_test: Option<String>,
 }
 
@@ -215,6 +233,8 @@ pub struct Recommendation {
     #[serde(default)]
     pub source_test_kind: String,
     #[serde(default)]
+    pub model_identity: Option<ModelIdentity>,
+    #[serde(default)]
     pub requested_context: u64,
     #[serde(default)]
     pub validated_prompt_tokens: Option<u64>,
@@ -222,6 +242,10 @@ pub struct Recommendation {
     pub validation_level: ValidationLevel,
     #[serde(default)]
     pub compatibility: Compatibility,
+    #[serde(default)]
+    pub environment_valid: bool,
+    #[serde(default)]
+    pub telemetry_status: TelemetryStatus,
     #[serde(default)]
     pub stale_reason: Option<String>,
     pub command: Vec<String>,
@@ -256,6 +280,7 @@ pub struct CandidatePlan {
     pub schema_version: u32,
     pub generated_at: DateTime<Utc>,
     pub model_path: PathBuf,
+    pub model_identity: ModelIdentity,
     pub requested_context: u64,
     pub preset: Preset,
     pub environment: EnvironmentSnapshot,
@@ -297,12 +322,34 @@ pub fn build_recommendations(
     safety: &SafetyLimits,
     current_environment: Option<&EnvironmentSnapshot>,
 ) -> RecommendationFile {
+    let model_identity = read_metadata(&model_path)
+        .ok()
+        .map(|metadata| metadata.model_identity());
+    build_recommendations_for_model(
+        model_path,
+        model_identity.as_ref(),
+        results,
+        safety,
+        current_environment,
+    )
+}
+
+pub fn build_recommendations_for_model(
+    model_path: PathBuf,
+    model_identity: Option<&ModelIdentity>,
+    results: &[ProfileResult],
+    safety: &SafetyLimits,
+    current_environment: Option<&EnvironmentSnapshot>,
+) -> RecommendationFile {
     let mut profiles = Vec::new();
     let usable: Vec<&ProfileResult> = results
         .iter()
         .filter(|result| result.outcome.is_usable())
         .filter(|result| passes_safety(result, safety))
         .filter(|result| run_compatibility(result, current_environment).is_current())
+        .filter(|result| {
+            model_identity.is_none_or(|identity| result.model_identity.as_ref() == Some(identity))
+        })
         .collect();
 
     if let Some(result) = best_by(&usable, generation_score) {
@@ -346,15 +393,6 @@ pub fn build_recommendations(
         ));
     }
 
-    if let Some(result) = best_by(&usable, quality_score) {
-        profiles.push(to_recommendation(
-            "quality-night",
-            "Highest observed rough quant tier that starts and passes sanity",
-            result,
-            safety,
-        ));
-    }
-
     dedupe_profiles(&mut profiles);
     let rejected = results
         .iter()
@@ -363,6 +401,8 @@ pub fn build_recommendations(
                 && (!result.outcome.is_usable()
                     || !passes_safety(result, safety)
                     || matches!(result.outcome, Outcome::TooTight))
+                && model_identity
+                    .is_none_or(|identity| result.model_identity.as_ref() == Some(identity))
         })
         .map(|result| RejectedRun {
             run_id: result.run_id.clone(),
@@ -375,11 +415,29 @@ pub fn build_recommendations(
         .iter()
         .filter_map(|result| {
             let compatibility = run_compatibility(result, current_environment);
-            (!compatibility.is_current()).then(|| StaleRun {
+            let identity_stale = model_identity
+                .is_some_and(|identity| result.model_identity.as_ref() != Some(identity));
+            (!compatibility.is_current() || identity_stale).then(|| StaleRun {
                 run_id: result.run_id.clone(),
                 candidate_id: result.candidate.id.clone(),
-                compatibility,
-                reason: compatibility.reason().to_string(),
+                compatibility: if identity_stale {
+                    if result.model_identity.is_none() {
+                        Compatibility::LegacyMissingIdentity
+                    } else {
+                        Compatibility::ModelChanged
+                    }
+                } else {
+                    compatibility
+                },
+                reason: if identity_stale {
+                    if result.model_identity.is_none() {
+                        Compatibility::LegacyMissingIdentity.reason().to_string()
+                    } else {
+                        Compatibility::ModelChanged.reason().to_string()
+                    }
+                } else {
+                    compatibility.reason().to_string()
+                },
             })
         })
         .collect();
@@ -399,10 +457,12 @@ pub fn build_recommendations(
         schema_version: SCHEMA_VERSION,
         generated_at: Utc::now(),
         model_path,
+        model_identity: model_identity.cloned(),
         profiles,
         rejected,
         stale,
         environment: current_environment.cloned(),
+        environment_valid: current_environment.is_some(),
         next_suggested_test,
     }
 }
@@ -413,38 +473,6 @@ pub fn command_display(command: &[String]) -> String {
         .map(|part| shell_escape(part))
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-pub fn quant_quality_score(quant: Option<&str>) -> f64 {
-    let Some(quant) = quant else {
-        return 0.0;
-    };
-    let quant = quant.to_ascii_uppercase();
-    if quant.contains("F32") {
-        100.0
-    } else if quant.contains("BF16") || quant.contains("F16") {
-        95.0
-    } else if quant.contains("Q8") {
-        88.0
-    } else if quant.contains("Q6") {
-        76.0
-    } else if quant.contains("Q5") {
-        66.0
-    } else if quant.contains("IQ4") {
-        58.0
-    } else if quant.contains("Q4") {
-        54.0
-    } else if quant.contains("IQ3") {
-        46.0
-    } else if quant.contains("Q3") {
-        42.0
-    } else if quant.contains("IQ2") {
-        34.0
-    } else if quant.contains("Q2") {
-        30.0
-    } else {
-        10.0
-    }
 }
 
 fn dense_candidates(requested_context: u64) -> Vec<CandidateConfig> {
@@ -659,9 +687,9 @@ fn add_context_fallback_candidates(candidates: &mut Vec<CandidateConfig>, reques
             candidate.requested_context = context;
             candidate.id = format!("{}-ctx{context}", candidate.id);
             candidate.expected_risk = CandidateRisk::Low;
-            candidate.planning_note = format!(
+            candidate.planning_note =
                 "fallback below native/requested context after higher-context candidates fail or run too tight"
-            );
+                    .to_string();
             candidates.push(candidate);
         }
     }
@@ -761,10 +789,6 @@ fn balanced_score(result: &ProfileResult) -> f64 {
     2.0 * generation * prompt / (generation + prompt)
 }
 
-fn quality_score(result: &ProfileResult) -> f64 {
-    quant_quality_score(result.quant.as_deref()) + generation_score(result).ln_1p()
-}
-
 fn to_recommendation(
     id: &str,
     role: &str,
@@ -777,10 +801,13 @@ fn to_recommendation(
         source_run_id: result.run_id.clone(),
         source_candidate_id: result.candidate.id.clone(),
         source_test_kind: result.test_kind.clone(),
+        model_identity: result.model_identity.clone(),
         requested_context: result.requested_context,
         validated_prompt_tokens: result.prompt_tokens,
         validation_level: result.validation_level,
         compatibility: result.compatibility,
+        environment_valid: result.environment.is_some() && result.compatibility.is_current(),
+        telemetry_status: result.telemetry_status,
         stale_reason: None,
         command: result.command.clone(),
         command_display: result.command_display.clone(),
@@ -812,7 +839,9 @@ fn dedupe_profiles(profiles: &mut Vec<Recommendation>) {
 }
 
 fn risk_label(result: &ProfileResult, safety: &SafetyLimits) -> String {
-    let free = result.metrics.min_free_vram_mib.unwrap_or(u64::MAX);
+    let Some(free) = result.metrics.min_free_vram_mib else {
+        return "unknown".to_string();
+    };
     let swap = result.metrics.swap_delta_mib.unwrap_or(0);
     if free < safety.min_vram_free_mib || swap > safety.max_swap_delta_mib as i64 {
         "high".to_string()
@@ -970,6 +999,7 @@ mod tests {
             ended_at: Utc::now(),
             model_path: gguf.path.clone(),
             model_size_bytes: gguf.file_size_bytes,
+            model_identity: Some(gguf.model_identity()),
             gguf: gguf.clone(),
             quant: gguf.quant.clone(),
             command: vec!["llama-server".to_string()],
@@ -1012,6 +1042,7 @@ mod tests {
             environment: Some(fake_environment()),
             validation_level: ValidationLevel::StandardIngest,
             compatibility: crate::environment::Compatibility::Current,
+            telemetry_status: TelemetryStatus::Measured,
         }
     }
 
@@ -1045,6 +1076,58 @@ mod tests {
         assert_eq!(fast.source_run_id, "current-slow");
         assert_eq!(recs.stale.len(), 1);
         assert_eq!(recs.stale[0].run_id, "stale-fast");
+    }
+
+    #[test]
+    fn legacy_results_are_retained_as_stale_but_never_scored() {
+        let gguf = fake_metadata(Some("Q4_K_M"));
+        let current_identity = gguf.model_identity();
+        let mut legacy = fake_result(
+            "legacy-fast",
+            &gguf,
+            100.0,
+            100.0,
+            Some(4096),
+            Outcome::Pass,
+        );
+        legacy.model_identity = None;
+        let recs = build_recommendations_for_model(
+            gguf.path.clone(),
+            Some(&current_identity),
+            &[legacy],
+            &SafetyLimits::default(),
+            Some(&fake_environment()),
+        );
+        assert!(recs.profiles.is_empty());
+        assert_eq!(
+            recs.stale[0].compatibility,
+            Compatibility::LegacyMissingIdentity
+        );
+    }
+
+    #[test]
+    fn missing_vram_telemetry_is_unknown_and_not_interactive_safe() {
+        let gguf = fake_metadata(Some("Q4_K_M"));
+        let result = fake_result("no-telemetry", &gguf, 100.0, 100.0, None, Outcome::Pass);
+        let recs = build_recommendations_for_model(
+            gguf.path.clone(),
+            Some(&gguf.model_identity()),
+            &[result],
+            &SafetyLimits::default(),
+            Some(&fake_environment()),
+        );
+        let fast = recs
+            .profiles
+            .iter()
+            .find(|profile| profile.id == "interactive-fast")
+            .unwrap();
+        assert_eq!(fast.risk, "unknown");
+        assert!(
+            !recs
+                .profiles
+                .iter()
+                .any(|profile| profile.id == "interactive-safe")
+        );
     }
 
     #[test]

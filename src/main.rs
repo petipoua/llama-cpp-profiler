@@ -5,7 +5,7 @@ use llama_cpp_profiler::gguf;
 use llama_cpp_profiler::profile::{Preset, SafetyLimits};
 use llama_cpp_profiler::report::{self, ExportOptions, ReportOptions};
 use llama_cpp_profiler::runner::{
-    self, FullCtxOptions, RecommendOptions, ServeOptions, TuneOptions,
+    self, FullCtxOptions, ProbeMode, RecommendOptions, ServeOptions, TuneOptions,
 };
 use std::path::PathBuf;
 
@@ -59,10 +59,12 @@ struct InspectArgs {
 #[derive(Debug, Args)]
 struct TuneArgs {
     path: PathBuf,
-    #[arg(long, default_value_t = 262_144)]
-    ctx: u64,
-    #[arg(long, default_value = "standard")]
+    #[arg(long)]
+    ctx: Option<u64>,
+    #[arg(long, default_value = "quick")]
     preset: Preset,
+    #[arg(long, value_enum, default_value_t = ProbeMode::Thinking)]
+    probe_mode: ProbeMode,
     #[arg(long)]
     max_runs: Option<usize>,
     #[arg(long, default_value_t = 512)]
@@ -93,10 +95,12 @@ struct TuneArgs {
 #[derive(Debug, Args)]
 struct RecommendArgs {
     path: PathBuf,
-    #[arg(long, default_value_t = 262_144)]
-    ctx: u64,
-    #[arg(long, default_value = "standard")]
+    #[arg(long)]
+    ctx: Option<u64>,
+    #[arg(long, default_value = "quick")]
     preset: Preset,
+    #[arg(long, value_enum, default_value_t = ProbeMode::Thinking)]
+    probe_mode: ProbeMode,
     #[arg(long)]
     max_runs: Option<usize>,
     #[arg(long, default_value = "interactive-fast")]
@@ -132,8 +136,10 @@ struct FullCtxArgs {
     profile: String,
     #[arg(long, default_value_t = 250_000)]
     target_tokens: u64,
-    #[arg(long, default_value_t = 262_144)]
-    ctx: u64,
+    #[arg(long)]
+    ctx: Option<u64>,
+    #[arg(long, value_enum, default_value_t = ProbeMode::Thinking)]
+    probe_mode: ProbeMode,
     #[arg(long, default_value_t = 512)]
     min_vram_free_mib: u64,
     #[arg(long, default_value_t = 1024)]
@@ -221,6 +227,26 @@ async fn main() -> Result<()> {
                         .unwrap_or_else(|| "-".to_string())
                 );
                 println!(
+                    "chat template: {}",
+                    if value["tokenizer_has_chat_template"]
+                        .as_bool()
+                        .unwrap_or(false)
+                    {
+                        "present"
+                    } else {
+                        "missing"
+                    }
+                );
+                println!(
+                    "MoE experts: {}/{}",
+                    value["expert_used_count"]
+                        .as_u64()
+                        .map_or_else(|| "-".to_string(), |v| v.to_string()),
+                    value["expert_count"]
+                        .as_u64()
+                        .map_or_else(|| "-".to_string(), |v| v.to_string())
+                );
+                println!(
                     "prior runs: {}",
                     value["prior_run_count"]
                         .as_u64()
@@ -237,7 +263,7 @@ async fn main() -> Result<()> {
             let recs = runner::run_tune(
                 &args.path,
                 TuneOptions {
-                    ctx_cap: Some(args.ctx),
+                    ctx_cap: args.ctx,
                     preset: args.preset,
                     max_runs: args.max_runs,
                     safety: SafetyLimits {
@@ -250,6 +276,7 @@ async fn main() -> Result<()> {
                     plan_only,
                     near_full_ingest: args.near_full_ingest,
                     near_full_target_tokens: args.near_full_target_tokens,
+                    probe_mode: args.probe_mode,
                 },
             )
             .await?;
@@ -261,7 +288,7 @@ async fn main() -> Result<()> {
             let recommendation = runner::run_recommend(
                 &args.path,
                 RecommendOptions {
-                    ctx_cap: Some(args.ctx),
+                    ctx_cap: args.ctx,
                     preset: args.preset,
                     max_runs: args.max_runs,
                     profile: args.profile,
@@ -276,6 +303,7 @@ async fn main() -> Result<()> {
                     near_full_ingest: args.near_full_ingest,
                     near_full_target_tokens: args.near_full_target_tokens,
                     agent: args.agent,
+                    probe_mode: args.probe_mode,
                 },
             )
             .await?;
@@ -296,13 +324,14 @@ async fn main() -> Result<()> {
                 FullCtxOptions {
                     profile: args.profile,
                     target_tokens: args.target_tokens,
-                    ctx_cap: Some(args.ctx),
+                    ctx_cap: args.ctx,
                     safety: SafetyLimits {
                         min_vram_free_mib: args.min_vram_free_mib,
                         max_swap_delta_mib: args.max_swap_delta_mib,
                     },
                     port_start: args.port_start,
                     gpu_index: args.gpu_index,
+                    probe_mode: args.probe_mode,
                 },
             )
             .await?;
