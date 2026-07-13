@@ -11,6 +11,7 @@ The profiler records evidence that applies to any `llama-server` client:
 - exact `llama-server` command
 - profiler, hardware, GPU, driver, and `llama-server` environment snapshot
 - context, batch, microbatch, KV cache, fit target, and MoE placement
+- generation and prompt-processing thread counts when explicitly refined
 - prompt ingest throughput
 - generation throughput
 - client-observed TTFT through `/v1/chat/completions`
@@ -72,6 +73,22 @@ little VRAM for a normal desktop session.
 
 The profiler records failed startup and OOM boundaries because they are useful
 evidence: future agents should not retry the same aggressive settings blindly.
+
+## Thread Refinement
+
+After the bounded placement search, the profiler selects its best balanced
+primary result. If that placement has CPU-resident MoE experts, explicit partial
+GPU offload, or a server log that reports only some layers offloaded, it runs a
+second-stage thread sweep. Fully GPU-resident winners and servers without both
+`--threads` and `--threads-batch` skip it.
+
+The sweep reruns the winner with llama.cpp defaults and up to four explicit,
+topology-derived pairs: half physical/all physical, all physical/all physical,
+all physical/all logical, and all logical/all logical. Duplicate pairs are
+removed. The contemporaneous default rerun is the baseline; an explicit pair is
+eligible for recommendations only when its harmonic mean of prompt and output
+throughput improves by at least 3%. All observations remain in the run artifacts.
+The primary `--max-runs` budget does not include these up to five refinement runs.
 
 ## Probe Set
 

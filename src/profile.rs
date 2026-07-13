@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 pub const AGENT_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -75,6 +75,10 @@ pub struct CandidateConfig {
     pub gpu_layers: Option<u64>,
     pub cpu_moe: bool,
     pub n_cpu_moe: Option<u64>,
+    #[serde(default)]
+    pub threads: Option<usize>,
+    #[serde(default)]
+    pub threads_batch: Option<usize>,
     #[serde(default)]
     pub expected_risk: CandidateRisk,
     pub note: String,
@@ -344,6 +348,7 @@ pub fn build_recommendations_for_model(
     let mut profiles = Vec::new();
     let usable: Vec<&ProfileResult> = results
         .iter()
+        .filter(|result| result.test_kind != "thread-refinement-observation")
         .filter(|result| result.outcome.is_usable())
         .filter(|result| passes_safety(result, safety))
         .filter(|result| run_compatibility(result, current_environment).is_current())
@@ -498,6 +503,8 @@ fn dense_candidates(requested_context: u64) -> Vec<CandidateConfig> {
             gpu_layers: None,
             cpu_moe: false,
             n_cpu_moe: None,
+            threads: None,
+            threads_batch: None,
             expected_risk: CandidateRisk::Medium,
             note: "dense sweep over batch, ubatch, KV cache, and llama.cpp fit target".to_string(),
             planning_note: String::new(),
@@ -531,6 +538,8 @@ fn dense_candidates(requested_context: u64) -> Vec<CandidateConfig> {
                     gpu_layers: None,
                     cpu_moe: false,
                     n_cpu_moe: None,
+                    threads: None,
+                    threads_batch: None,
                     expected_risk: CandidateRisk::Medium,
                     note: "dense sweep over batch, ubatch, KV cache, and llama.cpp fit target"
                         .to_string(),
@@ -556,6 +565,8 @@ fn moe_candidates(metadata: &GgufMetadata, requested_context: u64) -> Vec<Candid
                 gpu_layers: None,
                 cpu_moe: true,
                 n_cpu_moe: None,
+                threads: None,
+                threads_batch: None,
                 expected_risk: CandidateRisk::Low,
                 note: "MoE baseline with CPU expert offload enabled".to_string(),
                 planning_note: String::new(),
@@ -596,6 +607,8 @@ fn moe_candidates(metadata: &GgufMetadata, requested_context: u64) -> Vec<Candid
                     gpu_layers: None,
                     cpu_moe: false,
                     n_cpu_moe: Some(*n_cpu_moe),
+                    threads: None,
+                    threads_batch: None,
                     expected_risk: CandidateRisk::Medium,
                     note: "MoE sweep from safer CPU-heavy expert placement toward GPU residency"
                         .to_string(),
@@ -616,6 +629,8 @@ fn moe_candidates(metadata: &GgufMetadata, requested_context: u64) -> Vec<Candid
             gpu_layers: None,
             cpu_moe: true,
             n_cpu_moe: None,
+            threads: None,
+            threads_batch: None,
             expected_risk: CandidateRisk::Low,
             note: "MoE baseline with CPU expert offload enabled".to_string(),
             planning_note: String::new(),
@@ -929,6 +944,33 @@ mod tests {
     }
 
     #[test]
+    fn unaccepted_thread_observations_are_not_scored() {
+        let gguf = fake_metadata(Some("Q4_K_M"));
+        let baseline = fake_result("baseline", &gguf, 10.0, 100.0, Some(2048), Outcome::Pass);
+        let mut observation = fake_result(
+            "thread-observation",
+            &gguf,
+            100.0,
+            1000.0,
+            Some(2048),
+            Outcome::Pass,
+        );
+        observation.test_kind = "thread-refinement-observation".to_string();
+        let recs = build_recommendations(
+            PathBuf::from("/models/test.gguf"),
+            &[baseline, observation],
+            &SafetyLimits::default(),
+            Some(&fake_environment()),
+        );
+
+        assert!(
+            recs.profiles
+                .iter()
+                .all(|profile| profile.source_run_id == "baseline")
+        );
+    }
+
+    #[test]
     fn generates_cpu_heavy_moe_candidates_first() {
         let mut metadata = fake_metadata(Some("Q4_K_M"));
         metadata.model_kind = ModelKind::Moe;
@@ -1014,6 +1056,8 @@ mod tests {
                 gpu_layers: None,
                 cpu_moe: false,
                 n_cpu_moe: None,
+                threads: None,
+                threads_batch: None,
                 expected_risk: CandidateRisk::Medium,
                 note: String::new(),
                 planning_note: String::new(),

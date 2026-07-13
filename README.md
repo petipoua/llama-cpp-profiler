@@ -72,7 +72,10 @@ llama-cpp-profiler tune ~/Models/<model-or-gguf> --preset standard
 runs sanity/output/ingest probes, writes raw artifacts, and stops the server after
 each candidate. It can promote safer or more aggressive already-planned
 candidates from observed results, but stays within the selected preset or
-`--max-runs` budget. It does not run a 250k-token prompt.
+`--max-runs` primary-search budget. After that search, a winning placement with
+meaningful CPU work triggers up to five additional topology-aware thread
+refinement runs. Fully GPU-resident winners skip this stage. Tuning does not run
+a 250k-token prompt.
 
 The default `thinking` probe mode keeps the reasoning-oriented baseline:
 generated server commands and chat probes use `--reasoning on`,
@@ -182,6 +185,11 @@ llama-cpp-profiler export PATH [--markdown] [--opencode PATH] [--dry-run] [--wri
   are available for adaptive promotion after failed or too-tight runs.
 - Safety defaults are `--min-vram-free-mib 512` and `--max-swap-delta-mib 1024`.
 - `quick` runs at most 6 candidates; `standard` runs at most 16; `thorough` runs a broader sweep.
+- These limits apply to the primary placement search. A CPU-participating winner
+  can add up to five thread-refinement runs: llama.cpp defaults, half/all physical
+  cores, physical/logical splits, and all logical cores. Duplicate pairs are
+  removed on smaller systems, and an explicit pair replaces the default only at
+  a measured balanced-throughput improvement of at least 3%.
 - Plain `tune` and `recommend` default to `quick`; `standard` and `thorough` are explicit deeper modes.
 - `thinking` is the default probe mode; `generic` omits reasoning-specific arguments and request fields.
 - `quick` runs are labeled `smoke`; `standard` and `thorough` runs are labeled

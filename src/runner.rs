@@ -30,6 +30,7 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(180);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 const TELEMETRY_INTERVAL: Duration = Duration::from_millis(500);
 const THINKING_BUDGET_MESSAGE: &str = "I should stop thinking and answer now.";
+const THREAD_REFINEMENT_MIN_IMPROVEMENT: f64 = 0.03;
 
 #[derive(Debug, Clone)]
 pub struct TuneOptions {
@@ -238,6 +239,7 @@ pub async fn run_tune(path: &Path, options: TuneOptions) -> Result<Recommendatio
     let mut queue = VecDeque::from(all_candidates.clone());
     let mut seen = BTreeSet::new();
     let mut completed = 0usize;
+    let mut current_results = Vec::new();
     while completed < run_budget {
         let Some(candidate) = queue.pop_front() else {
             break;
@@ -291,7 +293,18 @@ pub async fn run_tune(path: &Path, options: TuneOptions) -> Result<Recommendatio
         );
         completed += 1;
         promote_adaptive_candidates(&mut queue, &seen, &result);
+        current_results.push(result);
     }
+
+    run_thread_refinement(
+        &metadata,
+        &capabilities,
+        &options,
+        &environment,
+        &current_results,
+        completed,
+    )
+    .await?;
 
     write_manifest(&metadata)?;
     let all_results = load_prior_results(&metadata.profiler_dir())?;
@@ -309,6 +322,258 @@ pub async fn run_tune(path: &Path, options: TuneOptions) -> Result<Recommendatio
     )?;
     report::write_latest_markdown(&metadata.profiler_dir(), &recommendations)?;
     Ok(recommendations)
+}
+
+async fn run_thread_refinement(
+    metadata: &GgufMetadata,
+    capabilities: &ServerCapabilities,
+    options: &TuneOptions,
+    environment: &EnvironmentSnapshot,
+    primary_results: &[ProfileResult],
+    completed_primary_runs: usize,
+) -> Result<()> {
+    if !capabilities.supports("--threads") || !capabilities.supports("--threads-batch") {
+        eprintln!("thread refinement skipped: llama-server does not expose both thread flags");
+        return Ok(());
+    }
+
+    let Some(winner) = primary_results
+        .iter()
+        .filter(|result| {
+            result.outcome.is_usable() && !violates_safety(&result.metrics, &options.safety)
+        })
+        .max_by(|left, right| {
+            balanced_throughput(left)
+                .partial_cmp(&balanced_throughput(right))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    else {
+        eprintln!("thread refinement skipped: no usable primary winner");
+        return Ok(());
+    };
+
+    if !has_meaningful_cpu_participation(winner, metadata) {
+        eprintln!("thread refinement skipped: winning placement is fully GPU-resident");
+        return Ok(());
+    }
+
+    let thread_candidates = thread_refinement_candidates(&winner.candidate, environment);
+    if thread_candidates.len() < 2 {
+        eprintln!("thread refinement skipped: CPU topology produced no distinct explicit pairs");
+        return Ok(());
+    }
+
+    eprintln!(
+        "thread refinement: testing {} configurations for {}",
+        thread_candidates.len(),
+        winner.candidate.id
+    );
+    let refinement_count = thread_candidates.len();
+    let mut refinement_results = Vec::new();
+    for (index, candidate) in thread_candidates.into_iter().enumerate() {
+        let port_offset = completed_primary_runs.saturating_add(index);
+        let port_offset = u16::try_from(port_offset).context("thread refinement port offset")?;
+        let port = find_open_port(options.port_start.saturating_add(port_offset))?;
+        eprintln!(
+            "  [threads {}/{}] {} on port {}",
+            index + 1,
+            refinement_count,
+            candidate.id,
+            port
+        );
+        let result = run_candidate(
+            metadata,
+            capabilities,
+            RunRequest {
+                test_kind: "thread-refinement-observation".to_string(),
+                candidate,
+                port,
+                prompt_plan: PromptPlan::Tune {
+                    ingest_target_tokens: options.preset.ingest_target_tokens(),
+                    near_full_ingest_tokens: None,
+                },
+                probe_mode: options.probe_mode,
+            },
+            &options.safety,
+            options.gpu_index,
+            environment.clone(),
+            if options.preset == Preset::Quick {
+                ValidationLevel::Smoke
+            } else {
+                ValidationLevel::StandardIngest
+            },
+        )
+        .await?;
+        eprintln!(
+            "    -> {:?}, output {:?} tok/s, prompt {:?} tok/s",
+            result.outcome,
+            result.metrics.server_generation_toks_per_s,
+            result.metrics.server_prompt_eval_toks_per_s
+        );
+        refinement_results.push(result);
+    }
+
+    accept_thread_refinement(&mut refinement_results, &options.safety)?;
+    Ok(())
+}
+
+fn thread_refinement_candidates(
+    winner: &CandidateConfig,
+    environment: &EnvironmentSnapshot,
+) -> Vec<CandidateConfig> {
+    let logical = environment
+        .cpu_cores
+        .or_else(|| std::thread::available_parallelism().ok().map(usize::from))
+        .unwrap_or(1)
+        .max(1);
+    let mut system = sysinfo::System::new_all();
+    system.refresh_cpu();
+    let physical = system
+        .physical_core_count()
+        .unwrap_or(logical)
+        .clamp(1, logical);
+    thread_pairs(physical, logical)
+        .into_iter()
+        .map(|(threads, threads_batch, label)| {
+            let mut candidate = winner.clone();
+            candidate.id = format!("{}-threads-{label}", winner.id);
+            candidate.threads = threads;
+            candidate.threads_batch = threads_batch;
+            candidate.note = format!(
+                "Thread refinement of {}; generation threads {}, prompt threads {}",
+                winner.id,
+                threads.map_or_else(
+                    || "llama.cpp default".to_string(),
+                    |value| value.to_string()
+                ),
+                threads_batch.map_or_else(
+                    || "llama.cpp default".to_string(),
+                    |value| value.to_string()
+                )
+            );
+            candidate.planning_note =
+                "conditional topology-aware refinement of the winning placement".to_string();
+            candidate
+        })
+        .collect()
+}
+
+fn thread_pairs(
+    physical: usize,
+    logical: usize,
+) -> Vec<(Option<usize>, Option<usize>, &'static str)> {
+    let logical = logical.max(1);
+    let physical = physical.clamp(1, logical);
+    let half_physical = (physical / 2).max(1);
+    let pairs = [
+        (None, None, "default"),
+        (Some(half_physical), Some(physical), "halfphys-phys"),
+        (Some(physical), Some(physical), "phys-phys"),
+        (Some(physical), Some(logical), "phys-logical"),
+        (Some(logical), Some(logical), "logical-logical"),
+    ];
+    let mut seen = BTreeSet::new();
+    pairs
+        .into_iter()
+        .filter(|(threads, threads_batch, _)| seen.insert((*threads, *threads_batch)))
+        .collect()
+}
+
+fn has_meaningful_cpu_participation(result: &ProfileResult, metadata: &GgufMetadata) -> bool {
+    if result.candidate.cpu_moe || result.candidate.n_cpu_moe.is_some_and(|value| value > 0) {
+        return true;
+    }
+    if result
+        .candidate
+        .gpu_layers
+        .zip(metadata.block_count)
+        .is_some_and(|(gpu_layers, blocks)| gpu_layers < blocks)
+    {
+        return true;
+    }
+    let log = fs::read_to_string(&result.artifacts.server_log).unwrap_or_default();
+    log_has_partial_gpu_offload(&log)
+}
+
+fn log_has_partial_gpu_offload(log: &str) -> bool {
+    let regex = Regex::new(r"offloaded\s+(\d+)\s*/\s*(\d+)\s+layers").expect("valid regex");
+    regex.captures_iter(log).any(|captures| {
+        let offloaded = captures
+            .get(1)
+            .and_then(|value| value.as_str().parse::<u64>().ok());
+        let total = captures
+            .get(2)
+            .and_then(|value| value.as_str().parse::<u64>().ok());
+        offloaded
+            .zip(total)
+            .is_some_and(|(offloaded, total)| offloaded < total)
+    })
+}
+
+fn balanced_throughput(result: &ProfileResult) -> f64 {
+    let generation = result.metrics.server_generation_toks_per_s.unwrap_or(0.0);
+    let prompt = result.metrics.server_prompt_eval_toks_per_s.unwrap_or(0.0);
+    if generation <= 0.0 || prompt <= 0.0 {
+        return 0.0;
+    }
+    2.0 * generation * prompt / (generation + prompt)
+}
+
+fn accept_thread_refinement(results: &mut [ProfileResult], safety: &SafetyLimits) -> Result<()> {
+    let Some(baseline) = results.iter().find(|result| {
+        result.candidate.threads.is_none()
+            && result.candidate.threads_batch.is_none()
+            && result.outcome.is_usable()
+            && !violates_safety(&result.metrics, safety)
+    }) else {
+        eprintln!("thread refinement: default-thread baseline did not pass");
+        return Ok(());
+    };
+    let baseline_score = balanced_throughput(baseline);
+    let best = results
+        .iter()
+        .enumerate()
+        .filter(|(_, result)| {
+            result.candidate.threads.is_some()
+                && result.outcome.is_usable()
+                && !violates_safety(&result.metrics, safety)
+        })
+        .max_by(|(_, left), (_, right)| {
+            balanced_throughput(left)
+                .partial_cmp(&balanced_throughput(right))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    let Some((best_index, best)) = best else {
+        eprintln!("thread refinement: no explicit thread configuration passed");
+        return Ok(());
+    };
+    let best_score = balanced_throughput(best);
+    if !thread_improvement_is_significant(baseline_score, best_score) {
+        eprintln!(
+            "thread refinement: retained llama.cpp defaults (best explicit balanced score {:.2}, baseline {:.2})",
+            best_score, baseline_score
+        );
+        return Ok(());
+    }
+
+    let improvement = (best_score / baseline_score - 1.0) * 100.0;
+    let accepted = &mut results[best_index];
+    accepted.test_kind = "thread-refinement".to_string();
+    accepted.note = format!(
+        "{}; accepted with {:.1}% balanced-throughput improvement over the contemporaneous default-thread baseline",
+        accepted.note, improvement
+    );
+    write_json(&accepted.artifacts.result_json, accepted)?;
+    eprintln!(
+        "thread refinement: accepted {} ({:.1}% balanced improvement)",
+        accepted.candidate.id, improvement
+    );
+    Ok(())
+}
+
+fn thread_improvement_is_significant(baseline_score: f64, candidate_score: f64) -> bool {
+    baseline_score > 0.0
+        && candidate_score >= baseline_score * (1.0 + THREAD_REFINEMENT_MIN_IMPROVEMENT)
 }
 
 pub async fn run_recommend(path: &Path, options: RecommendOptions) -> Result<RecommendOutput> {
@@ -457,6 +722,8 @@ fn prepend_explicit_n_cpu_moe_candidates(
             gpu_layers: None,
             cpu_moe: false,
             n_cpu_moe: Some(*value),
+            threads: None,
+            threads_batch: None,
             expected_risk: crate::profile::CandidateRisk::Medium,
             note: "Explicit MoE expert-placement probe requested on the CLI".to_string(),
             planning_note: "front-of-queue candidate from --n-cpu-moe-values".to_string(),
@@ -532,6 +799,8 @@ pub async fn run_fullctx(path: &Path, options: FullCtxOptions) -> Result<Profile
                     gpu_layers: None,
                     cpu_moe: false,
                     n_cpu_moe: None,
+                    threads: None,
+                    threads_batch: None,
                     expected_risk: crate::profile::CandidateRisk::Medium,
                     note: "fallback full-context candidate".to_string(),
                     planning_note: "fallback when no saved profile is available".to_string(),
@@ -1522,6 +1791,16 @@ fn build_command(
     {
         args.extend(["--n-cpu-moe".to_string(), n_cpu_moe.to_string()]);
     }
+    if let Some(threads) = candidate.threads
+        && capabilities.supports("--threads")
+    {
+        args.extend(["--threads".to_string(), threads.to_string()]);
+    }
+    if let Some(threads_batch) = candidate.threads_batch
+        && capabilities.supports("--threads-batch")
+    {
+        args.extend(["--threads-batch".to_string(), threads_batch.to_string()]);
+    }
     args
 }
 
@@ -2098,6 +2377,77 @@ llama_perf_context_print:        prompt eval time =   1000.00 ms / 16000 tokens 
     }
 
     #[test]
+    fn thread_pairs_follow_topology_and_deduplicate_small_systems() {
+        assert_eq!(
+            thread_pairs(16, 32),
+            vec![
+                (None, None, "default"),
+                (Some(8), Some(16), "halfphys-phys"),
+                (Some(16), Some(16), "phys-phys"),
+                (Some(16), Some(32), "phys-logical"),
+                (Some(32), Some(32), "logical-logical"),
+            ]
+        );
+        assert_eq!(
+            thread_pairs(1, 1),
+            vec![(None, None, "default"), (Some(1), Some(1), "halfphys-phys")]
+        );
+    }
+
+    #[test]
+    fn thread_refinement_requires_three_percent_balanced_improvement() {
+        assert!(!thread_improvement_is_significant(100.0, 102.99));
+        assert!(thread_improvement_is_significant(100.0, 103.0));
+        assert!(!thread_improvement_is_significant(0.0, 100.0));
+    }
+
+    #[test]
+    fn detects_explicit_and_logged_cpu_participation() {
+        let mut result = test_result(
+            test_candidate("moe-q8_0-cpu-moe-b1024-ub256", 1024, 256, 1536),
+            Outcome::Pass,
+            Some(4096),
+        );
+        assert!(has_meaningful_cpu_participation(&result, &result.gguf));
+
+        result.candidate.cpu_moe = false;
+        result.candidate.gpu_layers = Some(1);
+        result.gguf.block_count = Some(2);
+        assert!(has_meaningful_cpu_participation(&result, &result.gguf));
+        assert!(log_has_partial_gpu_offload(
+            "load_tensors: offloaded 40/49 layers to GPU"
+        ));
+        assert!(!log_has_partial_gpu_offload(
+            "load_tensors: offloaded 49/49 layers to GPU"
+        ));
+    }
+
+    #[test]
+    fn build_command_includes_explicit_thread_pair() {
+        let capabilities = ServerCapabilities {
+            executable: "llama-server".to_string(),
+            help: "--model --host --port -c --threads --threads-batch".to_string(),
+        };
+        let mut candidate = test_candidate("moe-cpu-moe", 1024, 256, 1536);
+        candidate.threads = Some(16);
+        candidate.threads_batch = Some(32);
+        let metadata = test_result(candidate.clone(), Outcome::Pass, Some(4096)).gguf;
+        let command = build_command(
+            &capabilities,
+            &metadata,
+            &candidate,
+            18080,
+            ProbeMode::Generic,
+        );
+        assert!(command.windows(2).any(|pair| pair == ["--threads", "16"]));
+        assert!(
+            command
+                .windows(2)
+                .any(|pair| pair == ["--threads-batch", "32"])
+        );
+    }
+
+    #[test]
     fn explicit_n_cpu_moe_candidates_are_prepended() {
         let metadata = GgufMetadata {
             path: PathBuf::from("/models/test.gguf"),
@@ -2285,6 +2635,8 @@ llama_perf_context_print:        prompt eval time =   1000.00 ms / 16000 tokens 
             gpu_layers: None,
             cpu_moe: id.contains("cpu-moe"),
             n_cpu_moe: None,
+            threads: None,
+            threads_batch: None,
             expected_risk: crate::profile::CandidateRisk::Medium,
             note: String::new(),
             planning_note: String::new(),

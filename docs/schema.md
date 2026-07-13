@@ -1,9 +1,9 @@
 # Data Schemas
 
-The schemas are versioned by `schema_version`. Beta schema version `3` adds
-versioned model identity and validation fields. Version `1` and `2` files are
-read best-effort, retained as evidence, and treated as legacy stale runs when
-they lack model identity.
+The schemas are versioned by `schema_version`. Beta schema version `4` adds
+optional candidate thread counts and thread-refinement run kinds. Version `3`
+added versioned model identity and validation fields. Earlier files are read
+best-effort; files without model identity are retained as legacy stale evidence.
 
 ## `result.json`
 
@@ -20,11 +20,17 @@ Important fields:
 - `gguf`: parsed GGUF metadata, including architecture, native context, quant, MoE expert counts, and chat-template presence.
 - `command`: argv array used to launch `llama-server`.
 - `command_display`: shell-escaped command string.
-- `candidate`: generated tuning config: context, batch, microbatch, KV cache type, fit target, GPU layer count, MoE placement flags, expected risk, note, and planning note.
+- `candidate`: generated tuning config: context, batch, microbatch, KV cache type,
+  fit target, GPU layer count, MoE placement flags, optional `threads` and
+  `threads_batch`, expected risk, note, and planning note. Null thread values use
+  llama.cpp defaults.
 - `candidate.expected_risk`, `candidate.planning_note`: hardware-aware planning annotations.
 - Explicit MoE candidates requested with `--n-cpu-moe-values` are normal
   candidates in artifacts and plans. Their ids end in `-explicit`.
-- `test_kind`: `tune` or `fullctx`.
+- `test_kind`: `tune`, `fullctx`, `thread-refinement`, or
+  `thread-refinement-observation`. The last kind records a tested pair that did
+  not clear the 3% balanced-throughput acceptance gate and is excluded from
+  recommendations.
 - `requested_context`: context passed to the server.
 - `validation_level`: serialized as `smoke`, `standard_ingest`, or `fullctx`; reports display `standard_ingest` as `standard-ingest`.
 - `environment`: profiler, OS/architecture, CPU, memory, GPU, and `llama-server` snapshot.
