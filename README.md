@@ -75,7 +75,10 @@ candidates from observed results, but stays within the selected preset or
 `--max-runs` primary-search budget. After that search, a winning placement with
 meaningful CPU work triggers up to five additional topology-aware thread
 refinement runs. Fully GPU-resident winners skip this stage. Tuning does not run
-a 250k-token prompt.
+a 250k-token prompt. `standard` and `thorough` then validate the best candidate
+with one realistic combined request: roughly 25% of context (bounded to 16k–64k
+input tokens, with output space reserved) and up to 1024 output tokens. This
+final validation is outside the primary-search and thread-refinement budgets.
 
 The default `thinking` probe mode keeps the reasoning-oriented baseline:
 generated server commands and chat probes use `--reasoning on`,
@@ -88,6 +91,19 @@ reports it. Use `--ctx` to cap or explicitly select a lower context. Lower-conte
 fallback candidates are kept in the plan and can be promoted after OOM, timeout,
 crash, or too-tight runs. Plain `tune` uses `quick` and never runs a near-full
 context probe automatically.
+
+Quick mode skips final-stage realistic validation unless `--validate-best` is
+set:
+
+```bash
+llama-cpp-profiler tune ~/Models/<model-or-gguf> --preset quick --validate-best
+```
+
+The final stage scales its timeout from the winner's short-probe throughput and
+tries the next balanced candidate after a crash, timeout, safety violation, or
+severe retained-throughput collapse. Early EOS is recorded as incomplete but
+still passes. Reports show actual prompt/output token counts and retained prompt
+and generation throughput.
 
 Use `--probe-mode generic` to omit reasoning-specific server arguments and request
 fields. Thinking mode remains the default.
@@ -167,8 +183,8 @@ generated Markdown block.
 ```bash
 llama-cpp-profiler scan PATH [--no-tui]
 llama-cpp-profiler inspect PATH [--json]
-llama-cpp-profiler tune PATH [--ctx TOKENS] [--preset quick|standard|thorough] [--probe-mode thinking|generic] [--max-runs N] [--min-vram-free-mib MIB] [--max-swap-delta-mib MIB] [--port-start PORT] [--gpu-index INDEX] [--n-cpu-moe-values VALUES] [--near-full-ingest] [--near-full-target-tokens TOKENS] [--plan] [--json]
-llama-cpp-profiler recommend PATH [--ctx TOKENS] [--preset quick|standard|thorough] [--probe-mode thinking|generic] [--max-runs N] [--profile ID] [--port PORT] [--min-vram-free-mib MIB] [--max-swap-delta-mib MIB] [--port-start PORT] [--gpu-index INDEX] [--n-cpu-moe-values VALUES] [--near-full-ingest] [--near-full-target-tokens TOKENS] [--agent]
+llama-cpp-profiler tune PATH [--ctx TOKENS] [--preset quick|standard|thorough] [--probe-mode thinking|generic] [--max-runs N] [--min-vram-free-mib MIB] [--max-swap-delta-mib MIB] [--port-start PORT] [--gpu-index INDEX] [--n-cpu-moe-values VALUES] [--near-full-ingest] [--near-full-target-tokens TOKENS] [--validate-best] [--plan] [--json]
+llama-cpp-profiler recommend PATH [--ctx TOKENS] [--preset quick|standard|thorough] [--probe-mode thinking|generic] [--max-runs N] [--profile ID] [--port PORT] [--min-vram-free-mib MIB] [--max-swap-delta-mib MIB] [--port-start PORT] [--gpu-index INDEX] [--n-cpu-moe-values VALUES] [--near-full-ingest] [--near-full-target-tokens TOKENS] [--validate-best] [--agent]
 llama-cpp-profiler fullctx PATH [--profile ID] [--target-tokens TOKENS] [--ctx TOKENS] [--probe-mode thinking|generic] [--min-vram-free-mib MIB] [--max-swap-delta-mib MIB] [--port-start PORT] [--gpu-index INDEX]
 llama-cpp-profiler report PATH [--agent] [--include-stale]
 llama-cpp-profiler serve PATH [--profile ID] [--port PORT] [--print] [--allow-stale]
@@ -190,10 +206,15 @@ llama-cpp-profiler export PATH [--markdown] [--opencode PATH] [--dry-run] [--wri
   cores, physical/logical splits, and all logical cores. Duplicate pairs are
   removed on smaller systems, and an explicit pair replaces the default only at
   a measured balanced-throughput improvement of at least 3%.
+- `standard` and `thorough` add final-stage realistic validation after thread
+  refinement. `quick` adds it only with `--validate-best`. Failed winners fall
+  back in balanced-score order; a failed validation disqualifies its short-probe
+  baseline from recommendations.
 - Plain `tune` and `recommend` default to `quick`; `standard` and `thorough` are explicit deeper modes.
 - `thinking` is the default probe mode; `generic` omits reasoning-specific arguments and request fields.
-- `quick` runs are labeled `smoke`; `standard` and `thorough` runs are labeled
-  `standard-ingest`; `fullctx` runs are labeled `fullctx`.
+- `quick` runs are labeled `smoke`; normal `standard` and `thorough` probes are
+  labeled `standard-ingest`; final-stage runs are labeled `realistic`; `fullctx`
+  runs are labeled `fullctx`.
 - `--n-cpu-moe-values` is a comma-separated MoE-only override that prepends
   explicit partial-MoE candidates, for example `32,31,30`.
 - `fullctx` targets near-full prompts by default. `tune` and `recommend` can run
@@ -227,7 +248,9 @@ overwrite one another):
 requests/responses for the run. `result.json` stores the exact command, GGUF
 metadata, probe summaries, parsed llama.cpp timing lines, client-observed TTFT,
 telemetry peaks/minimums, outcome, environment snapshot, validation level, and
-paths to raw artifacts.
+paths to raw artifacts. Final-stage results also store their baseline run,
+target and actual token counts, retained prompt/output throughput ratios, and
+whether generation ended before the 1024-token ceiling.
 
 ### Profiles
 

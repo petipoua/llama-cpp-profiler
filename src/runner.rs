@@ -2,9 +2,9 @@ use crate::environment::{EnvironmentSnapshot, capture_environment, compare_envir
 use crate::gguf::{GgufMetadata, ModelIdentity, read_metadata, resolve_model_path};
 use crate::profile::{
     ArtifactPaths, CandidateConfig, Manifest, Outcome, Preset, ProbeSummary, ProfileResult,
-    Recommendation, RecommendationFile, SCHEMA_VERSION, SafetyLimits, TelemetryStatus,
-    ValidationLevel, build_recommendations_for_model, command_display, generate_candidates,
-    generate_candidates_for_environment,
+    RealisticValidation, Recommendation, RecommendationFile, SCHEMA_VERSION, SafetyLimits,
+    TelemetryStatus, ValidationLevel, build_recommendations_for_model, command_display,
+    generate_candidates, generate_candidates_for_environment,
 };
 use crate::report;
 use crate::telemetry::TelemetrySampler;
@@ -31,6 +31,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 const TELEMETRY_INTERVAL: Duration = Duration::from_millis(500);
 const THINKING_BUDGET_MESSAGE: &str = "I should stop thinking and answer now.";
 const THREAD_REFINEMENT_MIN_IMPROVEMENT: f64 = 0.03;
+const REALISTIC_OUTPUT_TOKENS: u64 = 1024;
+const REALISTIC_MIN_RETAINED_RATIO: f64 = 0.25;
+const REALISTIC_TIMEOUT_MAX: Duration = Duration::from_secs(2 * 60 * 60);
 
 #[derive(Debug, Clone)]
 pub struct TuneOptions {
@@ -44,6 +47,7 @@ pub struct TuneOptions {
     pub plan_only: bool,
     pub near_full_ingest: bool,
     pub near_full_target_tokens: Option<u64>,
+    pub validate_best: bool,
     pub probe_mode: ProbeMode,
 }
 
@@ -79,6 +83,7 @@ pub struct RecommendOptions {
     pub n_cpu_moe_values: Vec<u64>,
     pub near_full_ingest: bool,
     pub near_full_target_tokens: Option<u64>,
+    pub validate_best: bool,
     pub agent: bool,
     pub probe_mode: ProbeMode,
 }
@@ -102,6 +107,7 @@ pub struct RecommendOutput {
     pub requested_context: u64,
     pub validated_prompt_tokens: Option<u64>,
     pub validation_level: ValidationLevel,
+    pub realistic_validation: Option<RealisticValidation>,
     pub risk: String,
     pub failures: Vec<crate::profile::RejectedRun>,
     pub stale: Vec<crate::profile::StaleRun>,
@@ -176,6 +182,11 @@ enum PromptPlan {
     },
     FullCtx {
         target_tokens: u64,
+    },
+    Realistic {
+        target_tokens: u64,
+        output_tokens: u64,
+        timeout: Duration,
     },
 }
 
@@ -296,7 +307,7 @@ pub async fn run_tune(path: &Path, options: TuneOptions) -> Result<Recommendatio
         current_results.push(result);
     }
 
-    run_thread_refinement(
+    let refined_winner = run_thread_refinement(
         &metadata,
         &capabilities,
         &options,
@@ -305,6 +316,28 @@ pub async fn run_tune(path: &Path, options: TuneOptions) -> Result<Recommendatio
         completed,
     )
     .await?;
+
+    if options.preset != Preset::Quick || options.validate_best {
+        let mut validation_candidates = current_results
+            .iter()
+            .filter(|result| {
+                result.outcome.is_usable() && !violates_safety(&result.metrics, &options.safety)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(refined) = refined_winner {
+            validation_candidates.push(refined);
+        }
+        run_realistic_validation(
+            &metadata,
+            &capabilities,
+            &options,
+            &environment,
+            validation_candidates,
+            completed.saturating_add(5),
+        )
+        .await?;
+    }
 
     write_manifest(&metadata)?;
     let all_results = load_prior_results(&metadata.profiler_dir())?;
@@ -331,10 +364,10 @@ async fn run_thread_refinement(
     environment: &EnvironmentSnapshot,
     primary_results: &[ProfileResult],
     completed_primary_runs: usize,
-) -> Result<()> {
+) -> Result<Option<ProfileResult>> {
     if !capabilities.supports("--threads") || !capabilities.supports("--threads-batch") {
         eprintln!("thread refinement skipped: llama-server does not expose both thread flags");
-        return Ok(());
+        return Ok(None);
     }
 
     let Some(winner) = primary_results
@@ -349,18 +382,18 @@ async fn run_thread_refinement(
         })
     else {
         eprintln!("thread refinement skipped: no usable primary winner");
-        return Ok(());
+        return Ok(None);
     };
 
     if !has_meaningful_cpu_participation(winner, metadata) {
         eprintln!("thread refinement skipped: winning placement is fully GPU-resident");
-        return Ok(());
+        return Ok(None);
     }
 
     let thread_candidates = thread_refinement_candidates(&winner.candidate, environment);
     if thread_candidates.len() < 2 {
         eprintln!("thread refinement skipped: CPU topology produced no distinct explicit pairs");
-        return Ok(());
+        return Ok(None);
     }
 
     eprintln!(
@@ -413,8 +446,187 @@ async fn run_thread_refinement(
         refinement_results.push(result);
     }
 
-    accept_thread_refinement(&mut refinement_results, &options.safety)?;
+    let accepted = accept_thread_refinement(&mut refinement_results, &options.safety)?
+        .map(|index| refinement_results[index].clone());
+    Ok(accepted)
+}
+
+async fn run_realistic_validation(
+    metadata: &GgufMetadata,
+    capabilities: &ServerCapabilities,
+    options: &TuneOptions,
+    environment: &EnvironmentSnapshot,
+    mut candidates: Vec<ProfileResult>,
+    port_offset: usize,
+) -> Result<()> {
+    candidates.sort_by(|left, right| {
+        balanced_throughput(right)
+            .partial_cmp(&balanced_throughput(left))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut seen = BTreeSet::new();
+    candidates.retain(|result| seen.insert(result.candidate.id.clone()));
+    if candidates.is_empty() {
+        eprintln!("realistic validation skipped: no usable candidate");
+        return Ok(());
+    }
+
+    for (index, baseline) in candidates.into_iter().enumerate() {
+        let target_tokens = realistic_validation_prompt_target(baseline.requested_context);
+        let timeout = realistic_validation_timeout(&baseline, target_tokens);
+        let offset = u16::try_from(port_offset.saturating_add(index))
+            .context("realistic validation port offset")?;
+        let port = find_open_port(options.port_start.saturating_add(offset))?;
+        let mut candidate = baseline.candidate.clone();
+        candidate.id = format!("{}-realistic-validation", candidate.id);
+        candidate.note = format!(
+            "Final-stage realistic validation of {} with about {} prompt tokens and up to {} output tokens",
+            baseline.candidate.id, target_tokens, REALISTIC_OUTPUT_TOKENS
+        );
+        eprintln!(
+            "realistic validation: {} on port {} (prompt ~{}, output up to {}, timeout {}s)",
+            baseline.candidate.id,
+            port,
+            target_tokens,
+            REALISTIC_OUTPUT_TOKENS,
+            timeout.as_secs()
+        );
+        let mut result = run_candidate(
+            metadata,
+            capabilities,
+            RunRequest {
+                test_kind: "realistic-validation".to_string(),
+                candidate,
+                port,
+                prompt_plan: PromptPlan::Realistic {
+                    target_tokens,
+                    output_tokens: REALISTIC_OUTPUT_TOKENS,
+                    timeout,
+                },
+                probe_mode: options.probe_mode,
+            },
+            &options.safety,
+            options.gpu_index,
+            environment.clone(),
+            ValidationLevel::Realistic,
+        )
+        .await?;
+        apply_realistic_validation_assessment(&mut result, &baseline, target_tokens);
+        write_json(&result.artifacts.result_json, &result)?;
+        eprintln!(
+            "  -> {:?}, generated {:?}/{}, prompt retained {}, output retained {}",
+            result.outcome,
+            result.completion_tokens,
+            REALISTIC_OUTPUT_TOKENS,
+            format_ratio(
+                result
+                    .realistic_validation
+                    .as_ref()
+                    .and_then(|value| value.prompt_retained_ratio)
+            ),
+            format_ratio(
+                result
+                    .realistic_validation
+                    .as_ref()
+                    .and_then(|value| value.generation_retained_ratio)
+            ),
+        );
+        if result.outcome.is_usable() {
+            return Ok(());
+        }
+        eprintln!(
+            "realistic validation: trying the next ranked candidate after {} failed",
+            baseline.candidate.id
+        );
+    }
+    eprintln!("realistic validation: all ranked candidates failed");
     Ok(())
+}
+
+fn realistic_validation_prompt_target(context: u64) -> u64 {
+    let target = (context / 4).clamp(16_000, 64_000);
+    target.min(context.saturating_sub(REALISTIC_OUTPUT_TOKENS).max(1))
+}
+
+fn realistic_validation_timeout(baseline: &ProfileResult, target_prompt_tokens: u64) -> Duration {
+    let prompt_seconds = baseline
+        .metrics
+        .server_prompt_eval_toks_per_s
+        .filter(|value| *value > 0.0)
+        .map_or(REQUEST_TIMEOUT.as_secs_f64(), |speed| {
+            target_prompt_tokens as f64 / speed
+        });
+    let generation_seconds = baseline
+        .metrics
+        .server_generation_toks_per_s
+        .filter(|value| *value > 0.0)
+        .map_or(REQUEST_TIMEOUT.as_secs_f64(), |speed| {
+            REALISTIC_OUTPUT_TOKENS as f64 / speed
+        });
+    let scaled = Duration::from_secs_f64((prompt_seconds + generation_seconds) * 2.0 + 120.0);
+    scaled.clamp(REQUEST_TIMEOUT, REALISTIC_TIMEOUT_MAX)
+}
+
+fn apply_realistic_validation_assessment(
+    result: &mut ProfileResult,
+    baseline: &ProfileResult,
+    target_prompt_tokens: u64,
+) {
+    let prompt_retained_ratio = retained_ratio(
+        result.metrics.server_prompt_eval_toks_per_s,
+        baseline.metrics.server_prompt_eval_toks_per_s,
+    );
+    let generation_retained_ratio = retained_ratio(
+        result.metrics.server_generation_toks_per_s,
+        baseline.metrics.server_generation_toks_per_s,
+    );
+    let incomplete_generation = result
+        .completion_tokens
+        .is_none_or(|tokens| tokens < REALISTIC_OUTPUT_TOKENS);
+    result.realistic_validation = Some(RealisticValidation {
+        baseline_run_id: baseline.run_id.clone(),
+        target_prompt_tokens,
+        requested_output_tokens: REALISTIC_OUTPUT_TOKENS,
+        actual_prompt_tokens: result.prompt_tokens,
+        actual_output_tokens: result.completion_tokens,
+        prompt_retained_ratio,
+        generation_retained_ratio,
+        incomplete_generation,
+    });
+    if result.outcome.is_usable()
+        && [prompt_retained_ratio, generation_retained_ratio]
+            .into_iter()
+            .flatten()
+            .any(|ratio| ratio < REALISTIC_MIN_RETAINED_RATIO)
+    {
+        result.outcome = Outcome::PerformanceDegraded;
+        result.note = format!(
+            "realistic validation retained less than {:.0}% of short-probe throughput",
+            REALISTIC_MIN_RETAINED_RATIO * 100.0
+        );
+    } else if result.outcome.is_usable() && incomplete_generation {
+        result.note = format!(
+            "realistic validation passed with early EOS after {} of up to {} requested output tokens",
+            result.completion_tokens.unwrap_or(0),
+            REALISTIC_OUTPUT_TOKENS
+        );
+    } else if result.outcome.is_usable() {
+        result.note = "realistic validation passed".to_string();
+    }
+}
+
+fn retained_ratio(measured: Option<f64>, baseline: Option<f64>) -> Option<f64> {
+    measured.zip(baseline).and_then(|(measured, baseline)| {
+        (baseline > 0.0 && measured.is_finite() && baseline.is_finite())
+            .then_some(measured / baseline)
+    })
+}
+
+fn format_ratio(value: Option<f64>) -> String {
+    value.map_or_else(
+        || "unknown".to_string(),
+        |value| format!("{:.0}%", value * 100.0),
+    )
 }
 
 fn thread_refinement_candidates(
@@ -519,7 +731,10 @@ fn balanced_throughput(result: &ProfileResult) -> f64 {
     2.0 * generation * prompt / (generation + prompt)
 }
 
-fn accept_thread_refinement(results: &mut [ProfileResult], safety: &SafetyLimits) -> Result<()> {
+fn accept_thread_refinement(
+    results: &mut [ProfileResult],
+    safety: &SafetyLimits,
+) -> Result<Option<usize>> {
     let Some(baseline) = results.iter().find(|result| {
         result.candidate.threads.is_none()
             && result.candidate.threads_batch.is_none()
@@ -527,7 +742,7 @@ fn accept_thread_refinement(results: &mut [ProfileResult], safety: &SafetyLimits
             && !violates_safety(&result.metrics, safety)
     }) else {
         eprintln!("thread refinement: default-thread baseline did not pass");
-        return Ok(());
+        return Ok(None);
     };
     let baseline_score = balanced_throughput(baseline);
     let best = results
@@ -545,7 +760,7 @@ fn accept_thread_refinement(results: &mut [ProfileResult], safety: &SafetyLimits
         });
     let Some((best_index, best)) = best else {
         eprintln!("thread refinement: no explicit thread configuration passed");
-        return Ok(());
+        return Ok(None);
     };
     let best_score = balanced_throughput(best);
     if !thread_improvement_is_significant(baseline_score, best_score) {
@@ -553,7 +768,7 @@ fn accept_thread_refinement(results: &mut [ProfileResult], safety: &SafetyLimits
             "thread refinement: retained llama.cpp defaults (best explicit balanced score {:.2}, baseline {:.2})",
             best_score, baseline_score
         );
-        return Ok(());
+        return Ok(None);
     }
 
     let improvement = (best_score / baseline_score - 1.0) * 100.0;
@@ -568,7 +783,7 @@ fn accept_thread_refinement(results: &mut [ProfileResult], safety: &SafetyLimits
         "thread refinement: accepted {} ({:.1}% balanced improvement)",
         accepted.candidate.id, improvement
     );
-    Ok(())
+    Ok(Some(best_index))
 }
 
 fn thread_improvement_is_significant(baseline_score: f64, candidate_score: f64) -> bool {
@@ -590,6 +805,7 @@ pub async fn run_recommend(path: &Path, options: RecommendOptions) -> Result<Rec
             plan_only: false,
             near_full_ingest: options.near_full_ingest,
             near_full_target_tokens: options.near_full_target_tokens,
+            validate_best: options.validate_best,
             probe_mode: options.probe_mode,
         },
     )
@@ -932,6 +1148,7 @@ fn recommend_output(
         requested_context: profile.requested_context,
         validated_prompt_tokens: profile.validated_prompt_tokens,
         validation_level: profile.validation_level,
+        realistic_validation: profile.realistic_validation.clone(),
         risk: profile.risk.clone(),
         failures: validation.failures,
         stale: validation.stale,
@@ -945,7 +1162,7 @@ pub fn profile_key(model_path: &Path, profile: &Recommendation) -> String {
 
 fn confidence_label(profile: &Recommendation) -> &'static str {
     match (profile.validation_level, profile.risk.as_str()) {
-        (ValidationLevel::Fullctx, "low" | "medium") => "high",
+        (ValidationLevel::Fullctx | ValidationLevel::Realistic, "low" | "medium") => "high",
         (ValidationLevel::StandardIngest, "low" | "medium") => "medium",
         (ValidationLevel::Smoke, "low" | "medium") => "low",
         _ => "low",
@@ -1136,6 +1353,7 @@ async fn run_candidate(
     metrics.server_generation_toks_per_s = timing.best_generation_toks_per_s();
     metrics.client_ttft_ms = probes
         .get("output")
+        .or_else(|| probes.get("realistic"))
         .or_else(|| probes.get("fullctx"))
         .or_else(|| probes.get("sanity"))
         .and_then(|probe| probe.ttft_ms);
@@ -1156,13 +1374,17 @@ async fn run_candidate(
     let prompt_tokens = timing.max_prompt_tokens().or_else(|| {
         probes
             .get("ingest")
+            .or_else(|| probes.get("realistic"))
             .or_else(|| probes.get("fullctx"))
             .and_then(|probe| probe.prompt_tokens)
     });
-    let completion_tokens = probes
-        .get("output")
-        .or_else(|| probes.get("sanity"))
-        .and_then(|probe| probe.completion_tokens);
+    let completion_tokens = timing.max_generation_tokens().or_else(|| {
+        probes
+            .get("realistic")
+            .or_else(|| probes.get("output"))
+            .or_else(|| probes.get("sanity"))
+            .and_then(|probe| probe.completion_tokens)
+    });
 
     write_json(&artifacts.request_json, &request_artifact)?;
     write_json(&artifacts.response_json, &response_artifact)?;
@@ -1194,6 +1416,7 @@ async fn run_candidate(
         validation_level,
         compatibility: compare_environment(Some(&environment), &environment),
         telemetry_status,
+        realistic_validation: None,
     };
     write_json(&result.artifacts.result_json, &result)?;
     Ok(result)
@@ -1208,6 +1431,40 @@ async fn drive_probes_with_server(
     let mut output = ProbeOutput::default();
     if let Err(err) = wait_for_server(base_url, child).await {
         output.fail("startup", err);
+        return output;
+    }
+
+    if let PromptPlan::Realistic {
+        target_tokens,
+        output_tokens,
+        timeout,
+    } = &request.prompt_plan
+    {
+        let (prompt, estimate) = repeated_realistic_prompt(*target_tokens);
+        let realistic = post_chat_completion_with_mode(
+            base_url,
+            &metadata.display_name(),
+            &prompt,
+            *output_tokens,
+            *timeout,
+            request.probe_mode,
+        )
+        .await;
+        let realistic = match realistic {
+            Ok(probe) => probe,
+            Err(err) => {
+                output.fail("realistic", err);
+                return output;
+            }
+        };
+        let mut summary = realistic.summary;
+        summary.prompt_tokens = Some(estimate);
+        output.record_summary(
+            "realistic",
+            summary,
+            realistic.request_json,
+            realistic.response_json,
+        );
         return output;
     }
 
@@ -1331,6 +1588,7 @@ async fn drive_probes_with_server(
                 fullctx.response_json,
             );
         }
+        PromptPlan::Realistic { .. } => unreachable!("handled before sanity probe"),
     }
 
     output
@@ -1846,6 +2104,7 @@ fn empty_result(metadata: &GgufMetadata, failed: FailedRun) -> ProfileResult {
         validation_level: failed.validation_level,
         compatibility: compare_environment(Some(&failed.environment), &failed.environment),
         telemetry_status: TelemetryStatus::Unknown,
+        realistic_validation: None,
     }
 }
 
@@ -2025,6 +2284,24 @@ fn repeated_license_prompt(target_tokens: u64) -> (String, u64) {
     (prompt, estimate)
 }
 
+fn repeated_realistic_prompt(target_tokens: u64) -> (String, u64) {
+    let source = fs::read_to_string("/usr/share/licenses/spdx/Apache-2.0.txt")
+        .unwrap_or_else(|_| include_str!("../fixtures/Apache-2.0.txt").to_string());
+    let target_chars = usize::try_from(target_tokens.saturating_mul(4)).unwrap_or(usize::MAX);
+    let instruction = "Analyze the following repeated license text. Produce a detailed, structured review of its obligations, permissions, risks, and practical compliance steps. Continue until the analysis is comprehensive.\n\n";
+    let mut prompt = instruction.chars().take(target_chars).collect::<String>();
+    let remaining = target_chars.saturating_sub(prompt.chars().count());
+    prompt.extend(
+        source
+            .chars()
+            .chain(std::iter::once('\n'))
+            .cycle()
+            .take(remaining),
+    );
+    let estimate = estimate_tokens(&prompt);
+    (prompt, estimate)
+}
+
 fn near_full_ingest_target(requested_context: u64) -> u64 {
     if requested_context <= 2_048 {
         return requested_context.saturating_mul(3) / 4;
@@ -2072,6 +2349,10 @@ impl TimingSummary {
 
     fn max_prompt_tokens(&self) -> Option<u64> {
         self.prompt_evals.iter().map(|timing| timing.tokens).max()
+    }
+
+    fn max_generation_tokens(&self) -> Option<u64> {
+        self.evals.iter().map(|timing| timing.tokens).max()
     }
 }
 
@@ -2402,6 +2683,68 @@ llama_perf_context_print:        prompt eval time =   1000.00 ms / 16000 tokens 
     }
 
     #[test]
+    fn realistic_validation_target_is_bounded_and_reserves_output_context() {
+        assert_eq!(realistic_validation_prompt_target(131_072), 32_768);
+        assert_eq!(realistic_validation_prompt_target(1_000_000), 64_000);
+        assert_eq!(realistic_validation_prompt_target(65_536), 16_384);
+        assert_eq!(realistic_validation_prompt_target(8_192), 7_168);
+        let (_, estimate) = repeated_realistic_prompt(32_768);
+        assert_eq!(estimate, 32_768);
+    }
+
+    #[test]
+    fn realistic_validation_timeout_scales_and_is_bounded() {
+        let mut baseline = test_result(
+            test_candidate("baseline", 1024, 256, 1536),
+            Outcome::Pass,
+            Some(4096),
+        );
+        baseline.metrics.server_prompt_eval_toks_per_s = Some(100.0);
+        baseline.metrics.server_generation_toks_per_s = Some(10.0);
+        let scaled = realistic_validation_timeout(&baseline, 32_000);
+        assert!(scaled > REQUEST_TIMEOUT);
+        assert!(scaled < REALISTIC_TIMEOUT_MAX);
+
+        baseline.metrics.server_prompt_eval_toks_per_s = Some(1.0);
+        baseline.metrics.server_generation_toks_per_s = Some(1.0);
+        assert_eq!(
+            realistic_validation_timeout(&baseline, 64_000),
+            REALISTIC_TIMEOUT_MAX
+        );
+    }
+
+    #[test]
+    fn realistic_validation_accepts_early_eos_but_rejects_severe_degradation() {
+        let candidate = test_candidate("baseline", 1024, 256, 1536);
+        let mut baseline = test_result(candidate.clone(), Outcome::Pass, Some(4096));
+        baseline.run_id = "baseline-run".to_string();
+        baseline.metrics.server_prompt_eval_toks_per_s = Some(100.0);
+        baseline.metrics.server_generation_toks_per_s = Some(20.0);
+
+        let mut early_eos = test_result(candidate.clone(), Outcome::Pass, Some(4096));
+        early_eos.metrics.server_prompt_eval_toks_per_s = Some(80.0);
+        early_eos.metrics.server_generation_toks_per_s = Some(15.0);
+        early_eos.prompt_tokens = Some(32_000);
+        early_eos.completion_tokens = Some(400);
+        apply_realistic_validation_assessment(&mut early_eos, &baseline, 32_000);
+        assert_eq!(early_eos.outcome, Outcome::Pass);
+        assert!(
+            early_eos
+                .realistic_validation
+                .as_ref()
+                .unwrap()
+                .incomplete_generation
+        );
+
+        let mut degraded = test_result(candidate, Outcome::Pass, Some(4096));
+        degraded.metrics.server_prompt_eval_toks_per_s = Some(20.0);
+        degraded.metrics.server_generation_toks_per_s = Some(15.0);
+        degraded.completion_tokens = Some(1024);
+        apply_realistic_validation_assessment(&mut degraded, &baseline, 32_000);
+        assert_eq!(degraded.outcome, Outcome::PerformanceDegraded);
+    }
+
+    #[test]
     fn detects_explicit_and_logged_cpu_participation() {
         let mut result = test_result(
             test_candidate("moe-q8_0-cpu-moe-b1024-ub256", 1024, 256, 1536),
@@ -2555,6 +2898,7 @@ llama_perf_context_print:        prompt eval time =   1000.00 ms / 16000 tokens 
                 plan_only: false,
                 near_full_ingest: false,
                 near_full_target_tokens: None,
+                validate_best: true,
                 probe_mode: ProbeMode::Thinking,
             },
         )
@@ -2577,6 +2921,14 @@ llama_perf_context_print:        prompt eval time =   1000.00 ms / 16000 tokens 
             .join("result.json");
         let result: ProfileResult =
             serde_json::from_str(&fs::read_to_string(result_path).unwrap()).unwrap();
+        assert_eq!(result.test_kind, "realistic-validation");
+        assert_eq!(result.validation_level, ValidationLevel::Realistic);
+        assert!(
+            result
+                .realistic_validation
+                .as_ref()
+                .is_some_and(|validation| validation.incomplete_generation)
+        );
         assert_eq!(result.requested_context, 8_192);
         assert_command_contains_context(&result.command, 8_192);
         assert_command_contains_high_thinking_defaults(&result.command);
@@ -2704,6 +3056,7 @@ llama_perf_context_print:        prompt eval time =   1000.00 ms / 16000 tokens 
             validation_level: ValidationLevel::Smoke,
             compatibility: crate::environment::Compatibility::Current,
             telemetry_status: TelemetryStatus::Measured,
+            realistic_validation: None,
         }
     }
 

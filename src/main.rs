@@ -84,6 +84,9 @@ struct TuneArgs {
     /// Override the near-full ingest target token estimate.
     #[arg(long)]
     near_full_target_tokens: Option<u64>,
+    /// Validate the selected winner with a long prompt and up to 1024 output tokens.
+    #[arg(long)]
+    validate_best: bool,
     /// Print the candidate plan as JSON and do not start llama-server.
     #[arg(long)]
     plan: bool,
@@ -124,6 +127,9 @@ struct RecommendArgs {
     /// Override the near-full ingest target token estimate.
     #[arg(long)]
     near_full_target_tokens: Option<u64>,
+    /// Validate the selected winner with a long prompt and up to 1024 output tokens.
+    #[arg(long)]
+    validate_best: bool,
     /// Emit compact JSON for agents instead of human text.
     #[arg(long)]
     agent: bool,
@@ -276,6 +282,7 @@ async fn main() -> Result<()> {
                     plan_only,
                     near_full_ingest: args.near_full_ingest,
                     near_full_target_tokens: args.near_full_target_tokens,
+                    validate_best: args.validate_best,
                     probe_mode: args.probe_mode,
                 },
             )
@@ -302,6 +309,7 @@ async fn main() -> Result<()> {
                     n_cpu_moe_values: args.n_cpu_moe_values,
                     near_full_ingest: args.near_full_ingest,
                     near_full_target_tokens: args.near_full_target_tokens,
+                    validate_best: args.validate_best,
                     agent: args.agent,
                     probe_mode: args.probe_mode,
                 },

@@ -90,6 +90,26 @@ eligible for recommendations only when its harmonic mean of prompt and output
 throughput improves by at least 3%. All observations remain in the run artifacts.
 The primary `--max-runs` budget does not include these up to five refinement runs.
 
+## Final-Stage Realistic Validation
+
+After placement search and any accepted thread refinement, `standard` and
+`thorough` rank the current safe candidates by balanced throughput and validate
+the winner with one combined request. `quick` does this only with
+`--validate-best`. The prompt target is
+`min(max(context / 4, 16k), 64k)`, reduced when necessary to reserve room for up
+to 1024 output tokens. The timeout is estimated from the baseline prompt and
+generation speeds, doubled for margin, given 120 seconds of startup/variance
+allowance, and bounded between 10 minutes and 2 hours.
+
+The run records actual prompt and output tokens, TTFT, prompt and generation
+throughput, VRAM headroom, RAM/swap telemetry, and retained-throughput ratios
+against the short-probe baseline. Early EOS is a usable but incomplete result.
+A crash, timeout, safety violation, or either retained ratio below 25% marks the
+candidate as failed and advances to the next ranked candidate. This ratio gate
+detects extreme collapse without imposing a model-independent tok/s target.
+Once a realistic validation passes, recommendations are sourced from passed
+realistic runs; failed candidates' short-probe baselines are excluded.
+
 ## Probe Set
 
 Plain `tune` defaults to the bounded `quick` preset and never adds a near-full
@@ -101,7 +121,7 @@ context probe automatically. Its probes are:
 
 `quick` results are labeled with smoke validation even though the ingest probe is
 still run at the smaller 16k-token target. `standard` and `thorough` results are
-labeled `standard-ingest`.
+labeled `standard-ingest` before their final realistic validation stage.
 
 `tune --near-full-ingest` and `recommend --near-full-ingest` add one opt-in
 `near_full_ingest` probe using a one-shot repeated-text prompt just below the
@@ -109,9 +129,9 @@ requested context. The default target is about 94% of the requested context, so 
 266k context run targets roughly 250k estimated prompt tokens. This is separate
 from normal tuning because it can take substantially longer.
 
-`fullctx` is explicit opt-in and sends only the near-full prompt probe,
-defaulting to about 250k target tokens and `max_tokens = 1`. It exists for TTFT
-and stability checks, not for normal tuning.
+`fullctx` is explicit opt-in and sends a sanity probe followed by the near-full
+prompt probe, defaulting to about 250k target tokens and `max_tokens = 1`. It
+exists for TTFT and stability checks, not for normal tuning.
 
 Prompt token counts prefer server timing lines in `server.log`. Prompt
 generation uses `/usr/share/licenses/spdx/Apache-2.0.txt` when available, with a
@@ -131,7 +151,8 @@ Profiles are selected from observed runs that pass safety limits:
 - `balanced`: maximize harmonic mean of generation and prompt ingest speed.
 
 Rejected runs keep a compact reason: OOM, timeout, server crash, too-tight VRAM
-or swap use, interrupted, or parse-partial, with the first failure note line when
+or swap use, severe realistic-validation degradation, interrupted, or
+parse-partial, with the first failure note line when
 available. `parse-partial` is still usable for recommendation scoring when it
 passes safety limits because the request completed but one or more llama.cpp
 timing lines were missing.

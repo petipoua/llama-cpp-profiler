@@ -38,7 +38,7 @@ not as a guaranteed global optimum.
    `balanced`. Reuse the existing recommendation profiles and make the selected
    goal determine the primary result and generated server command.
 
-6. Add final-stage realistic workload validation
+6. Add final-stage realistic workload validation — implemented
 
    After the normal search selects its winner, validate that candidate with one
    combined long-prompt and sustained-generation request instead of making every
@@ -57,6 +57,12 @@ not as a guaranteed global optimum.
    the winner crashes, times out, becomes unsafe, or severely degrades, mark it as
    failing realistic validation and run the same validation against the next
    ranked candidate.
+
+   Implemented as a post-search stage enabled by default for `standard` and
+   `thorough`, or by `--validate-best` for `quick`. It uses a context-bounded
+   16k–64k prompt plus up to 1024 output tokens, a throughput-scaled timeout,
+   retained-throughput metadata, early-EOS labeling, severe-degradation and
+   safety checks, and balanced-score fallback candidates.
 
 7. Add thread-count candidates — implemented
 

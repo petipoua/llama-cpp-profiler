@@ -4,12 +4,12 @@ use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::str::FromStr;
 
-pub const SCHEMA_VERSION: u32 = 4;
-pub const AGENT_SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 5;
+pub const AGENT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -101,6 +101,7 @@ pub enum ValidationLevel {
     #[default]
     Smoke,
     StandardIngest,
+    Realistic,
     Fullctx,
 }
 
@@ -121,6 +122,7 @@ pub enum Outcome {
     ServerCrash,
     TooTight,
     ParsePartial,
+    PerformanceDegraded,
     Interrupted,
 }
 
@@ -153,6 +155,18 @@ pub struct ProbeSummary {
     pub ttft_ms: Option<u64>,
     pub wall_ms: Option<u64>,
     pub response_excerpt: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RealisticValidation {
+    pub baseline_run_id: String,
+    pub target_prompt_tokens: u64,
+    pub requested_output_tokens: u64,
+    pub actual_prompt_tokens: Option<u64>,
+    pub actual_output_tokens: Option<u64>,
+    pub prompt_retained_ratio: Option<f64>,
+    pub generation_retained_ratio: Option<f64>,
+    pub incomplete_generation: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -197,6 +211,8 @@ pub struct ProfileResult {
     pub compatibility: Compatibility,
     #[serde(default)]
     pub telemetry_status: TelemetryStatus,
+    #[serde(default)]
+    pub realistic_validation: Option<RealisticValidation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -261,6 +277,8 @@ pub struct Recommendation {
     pub headroom_mib: Option<u64>,
     pub risk: String,
     pub note: String,
+    #[serde(default)]
+    pub realistic_validation: Option<RealisticValidation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -346,9 +364,20 @@ pub fn build_recommendations_for_model(
     current_environment: Option<&EnvironmentSnapshot>,
 ) -> RecommendationFile {
     let mut profiles = Vec::new();
+    let failed_realistic_baselines = results
+        .iter()
+        .filter(|result| result.test_kind == "realistic-validation" && !result.outcome.is_usable())
+        .filter_map(|result| {
+            result
+                .realistic_validation
+                .as_ref()
+                .map(|validation| validation.baseline_run_id.clone())
+        })
+        .collect::<BTreeSet<_>>();
     let usable: Vec<&ProfileResult> = results
         .iter()
         .filter(|result| result.test_kind != "thread-refinement-observation")
+        .filter(|result| !failed_realistic_baselines.contains(&result.run_id))
         .filter(|result| result.outcome.is_usable())
         .filter(|result| passes_safety(result, safety))
         .filter(|result| run_compatibility(result, current_environment).is_current())
@@ -356,6 +385,16 @@ pub fn build_recommendations_for_model(
             model_identity.is_none_or(|identity| result.model_identity.as_ref() == Some(identity))
         })
         .collect();
+    let realistic: Vec<&ProfileResult> = usable
+        .iter()
+        .copied()
+        .filter(|result| result.test_kind == "realistic-validation")
+        .collect();
+    let usable = if realistic.is_empty() {
+        usable
+    } else {
+        realistic
+    };
 
     if let Some(result) = best_by(&usable, generation_score) {
         profiles.push(to_recommendation(
@@ -833,6 +872,7 @@ fn to_recommendation(
         headroom_mib: result.metrics.min_free_vram_mib,
         risk: risk_label(result, safety),
         note: result.note.clone(),
+        realistic_validation: result.realistic_validation.clone(),
     }
 }
 
@@ -971,6 +1011,73 @@ mod tests {
     }
 
     #[test]
+    fn successful_realistic_validation_becomes_the_recommendation_source() {
+        let gguf = fake_metadata(Some("Q4_K_M"));
+        let baseline = fake_result("baseline", &gguf, 50.0, 500.0, Some(2048), Outcome::Pass);
+        let mut validated = fake_result("validated", &gguf, 40.0, 400.0, Some(2048), Outcome::Pass);
+        validated.test_kind = "realistic-validation".to_string();
+        validated.validation_level = ValidationLevel::Realistic;
+        validated.realistic_validation = Some(RealisticValidation {
+            baseline_run_id: baseline.run_id.clone(),
+            target_prompt_tokens: 32_000,
+            requested_output_tokens: 1024,
+            actual_prompt_tokens: Some(32_000),
+            actual_output_tokens: Some(900),
+            prompt_retained_ratio: Some(0.8),
+            generation_retained_ratio: Some(0.8),
+            incomplete_generation: true,
+        });
+        let recs = build_recommendations(
+            PathBuf::from("/models/test.gguf"),
+            &[baseline, validated],
+            &SafetyLimits::default(),
+            Some(&fake_environment()),
+        );
+        assert!(
+            recs.profiles
+                .iter()
+                .all(|profile| profile.source_run_id == "validated")
+        );
+    }
+
+    #[test]
+    fn failed_realistic_validation_disqualifies_its_short_probe_baseline() {
+        let gguf = fake_metadata(Some("Q4_K_M"));
+        let baseline = fake_result("baseline", &gguf, 50.0, 500.0, Some(2048), Outcome::Pass);
+        let fallback = fake_result("fallback", &gguf, 30.0, 300.0, Some(2048), Outcome::Pass);
+        let mut failed = fake_result(
+            "failed-validation",
+            &gguf,
+            5.0,
+            50.0,
+            Some(2048),
+            Outcome::PerformanceDegraded,
+        );
+        failed.test_kind = "realistic-validation".to_string();
+        failed.realistic_validation = Some(RealisticValidation {
+            baseline_run_id: baseline.run_id.clone(),
+            target_prompt_tokens: 32_000,
+            requested_output_tokens: 1024,
+            actual_prompt_tokens: Some(32_000),
+            actual_output_tokens: Some(1024),
+            prompt_retained_ratio: Some(0.1),
+            generation_retained_ratio: Some(0.1),
+            incomplete_generation: false,
+        });
+        let recs = build_recommendations(
+            PathBuf::from("/models/test.gguf"),
+            &[baseline, fallback, failed],
+            &SafetyLimits::default(),
+            Some(&fake_environment()),
+        );
+        assert!(
+            recs.profiles
+                .iter()
+                .all(|profile| profile.source_run_id == "fallback")
+        );
+    }
+
+    #[test]
     fn generates_cpu_heavy_moe_candidates_first() {
         let mut metadata = fake_metadata(Some("Q4_K_M"));
         metadata.model_kind = ModelKind::Moe;
@@ -1087,6 +1194,7 @@ mod tests {
             validation_level: ValidationLevel::StandardIngest,
             compatibility: crate::environment::Compatibility::Current,
             telemetry_status: TelemetryStatus::Measured,
+            realistic_validation: None,
         }
     }
 

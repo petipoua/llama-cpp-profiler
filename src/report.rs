@@ -55,6 +55,7 @@ struct AgentMetric {
     requested_context: u64,
     validated_prompt_tokens: Option<u64>,
     validation_level: crate::profile::ValidationLevel,
+    realistic_validation: Option<crate::profile::RealisticValidation>,
     output_toks_per_s: Option<f64>,
     prompt_toks_per_s: Option<f64>,
     ttft_ms: Option<u64>,
@@ -139,6 +140,27 @@ pub fn print_report(root: &Path, options: ReportOptions) -> Result<()> {
                     "unknown; safety not validated"
                 },
             );
+            if let Some(validation) = recs
+                .profiles
+                .iter()
+                .find_map(|profile| profile.realistic_validation.as_ref())
+            {
+                println!(
+                    "{} realistic validation: prompt {}/{} tokens ({} retained); output {}/{} tokens ({} retained; {})",
+                    metadata.file_name,
+                    fmt_u64(validation.actual_prompt_tokens),
+                    validation.target_prompt_tokens,
+                    fmt_ratio(validation.prompt_retained_ratio),
+                    fmt_u64(validation.actual_output_tokens),
+                    validation.requested_output_tokens,
+                    fmt_ratio(validation.generation_retained_ratio),
+                    if validation.incomplete_generation {
+                        "early EOS"
+                    } else {
+                        "complete"
+                    },
+                );
+            }
         }
         if !recs.rejected.is_empty() {
             println!("\n{} rejected runs:", metadata.file_name);
@@ -335,6 +357,28 @@ pub fn markdown_for_recommendations(recommendations: &RecommendationFile) -> Str
             )
         }),
     ));
+    if let Some(validation) = recommendations
+        .profiles
+        .iter()
+        .find_map(|profile| profile.realistic_validation.as_ref())
+    {
+        lines.push(String::new());
+        lines.push("## Realistic validation".to_string());
+        lines.push(String::new());
+        lines.push(format!(
+            "- Prompt: {} actual / {} target tokens; retained throughput: {}",
+            fmt_u64(validation.actual_prompt_tokens),
+            validation.target_prompt_tokens,
+            fmt_ratio(validation.prompt_retained_ratio),
+        ));
+        lines.push(format!(
+            "- Output: {} actual / {} requested tokens; retained throughput: {}; sustained generation: {}",
+            fmt_u64(validation.actual_output_tokens),
+            validation.requested_output_tokens,
+            fmt_ratio(validation.generation_retained_ratio),
+            if validation.incomplete_generation { "incomplete (early EOS)" } else { "complete" },
+        ));
+    }
     if !recommendations.rejected.is_empty() {
         lines.push(String::new());
         lines.push("## Rejected".to_string());
@@ -428,6 +472,7 @@ fn print_agent_report(profiled: &[(GgufMetadata, RecommendationFile)]) -> Result
             requested_context: profile.requested_context,
             validated_prompt_tokens: profile.validated_prompt_tokens,
             validation_level: profile.validation_level,
+            realistic_validation: profile.realistic_validation.clone(),
             output_toks_per_s: profile.output_toks_per_s,
             prompt_toks_per_s: profile.prompt_toks_per_s,
             ttft_ms: profile.ttft_ms,
@@ -456,7 +501,10 @@ fn print_agent_report(profiled: &[(GgufMetadata, RecommendationFile)]) -> Result
 
 fn confidence_label(profile: &Recommendation) -> &'static str {
     match (profile.validation_level, profile.risk.as_str()) {
-        (crate::profile::ValidationLevel::Fullctx, "low" | "medium") => "high",
+        (
+            crate::profile::ValidationLevel::Fullctx | crate::profile::ValidationLevel::Realistic,
+            "low" | "medium",
+        ) => "high",
         (crate::profile::ValidationLevel::StandardIngest, "low" | "medium") => "medium",
         (crate::profile::ValidationLevel::Smoke, "low" | "medium") => "low",
         _ => "low",
@@ -650,6 +698,7 @@ fn validation_label(value: crate::profile::ValidationLevel) -> &'static str {
     match value {
         crate::profile::ValidationLevel::Smoke => "smoke",
         crate::profile::ValidationLevel::StandardIngest => "standard-ingest",
+        crate::profile::ValidationLevel::Realistic => "realistic",
         crate::profile::ValidationLevel::Fullctx => "fullctx",
     }
 }
@@ -658,6 +707,17 @@ fn fmt_f64(value: Option<f64>) -> String {
     value
         .map(|value| format!("{value:.2}"))
         .unwrap_or_else(|| "-".to_string())
+}
+
+fn fmt_u64(value: Option<u64>) -> String {
+    value.map_or_else(|| "unknown".to_string(), |value| value.to_string())
+}
+
+fn fmt_ratio(value: Option<f64>) -> String {
+    value.map_or_else(
+        || "unknown".to_string(),
+        |value| format!("{:.0}%", value * 100.0),
+    )
 }
 
 fn fmt_ms(value: Option<u64>) -> String {
@@ -778,6 +838,7 @@ mod tests {
             headroom_mib: Some(1),
             risk: "low".to_string(),
             note: String::new(),
+            realistic_validation: None,
         };
         let recommendations = RecommendationFile {
             schema_version: crate::profile::SCHEMA_VERSION,

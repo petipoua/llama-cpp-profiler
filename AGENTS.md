@@ -8,7 +8,7 @@ Preferred workflow for agents:
 
 1. Run `llama-cpp-profiler scan ~/Models` to discover GGUFs.
 2. Use `inspect <model> --json` before deciding whether the model is dense or MoE.
-3. Use `tune --preset quick` for short smoke-labeled runs and `tune --preset standard` for normal recommendations.
+3. Use `tune --preset quick` for short smoke-labeled runs and `tune --preset standard` for normal recommendations with final-stage realistic validation. Add `--validate-best` when a quick run also needs that validation.
 4. Use `report --agent` as the token-saving interface before reading raw logs.
 5. Use `serve --profile interactive-fast --print` to get the exact server command.
 

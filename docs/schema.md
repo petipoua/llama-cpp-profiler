@@ -1,7 +1,8 @@
 # Data Schemas
 
-The schemas are versioned by `schema_version`. Beta schema version `4` adds
-optional candidate thread counts and thread-refinement run kinds. Version `3`
+The schemas are versioned by `schema_version`. Beta schema version `5` adds
+realistic-validation metadata and outcomes. Version `4` added optional candidate
+thread counts and thread-refinement run kinds. Version `3`
 added versioned model identity and validation fields. Earlier files are read
 best-effort; files without model identity are retained as legacy stale evidence.
 
@@ -27,12 +28,13 @@ Important fields:
 - `candidate.expected_risk`, `candidate.planning_note`: hardware-aware planning annotations.
 - Explicit MoE candidates requested with `--n-cpu-moe-values` are normal
   candidates in artifacts and plans. Their ids end in `-explicit`.
-- `test_kind`: `tune`, `fullctx`, `thread-refinement`, or
+- `test_kind`: `tune`, `fullctx`, `realistic-validation`, `thread-refinement`, or
   `thread-refinement-observation`. The last kind records a tested pair that did
   not clear the 3% balanced-throughput acceptance gate and is excluded from
   recommendations.
 - `requested_context`: context passed to the server.
-- `validation_level`: serialized as `smoke`, `standard_ingest`, or `fullctx`; reports display `standard_ingest` as `standard-ingest`.
+- `validation_level`: serialized as `smoke`, `standard_ingest`, `realistic`, or
+  `fullctx`; reports display `standard_ingest` as `standard-ingest`.
 - `environment`: profiler, OS/architecture, CPU, memory, GPU, and `llama-server` snapshot.
 - `compatibility`: environment validation (`current`, `legacy_missing_snapshot`,
   `server_changed`, or `hardware_changed`). Stale records may additionally use
@@ -47,11 +49,16 @@ Important fields:
 - `metrics.ram_available_min_mib`, `metrics.swap_delta_mib`, `metrics.process_rss_peak_mib`, `metrics.cpu_util_avg_pct`: system/process telemetry.
 - `telemetry_status`: `measured` or `unknown`. Missing NVIDIA telemetry never
   receives a low-risk label and cannot qualify for `interactive-safe`.
-- `probes`: per-probe summaries for `sanity`, `output`, `ingest`,
+- `realistic_validation`: optional baseline run id, target/requested and actual
+  prompt/output token counts, prompt/output retained-throughput ratios, and an
+  `incomplete_generation` early-EOS flag.
+- `probes`: per-probe summaries for `sanity`, `output`, `ingest`, `realistic`,
   `near_full_ingest`, or `fullctx`. `tune` runs `sanity`, `output`, and
   `ingest`; `tune --near-full-ingest` and `recommend --near-full-ingest` also
-  run `near_full_ingest`; `fullctx` runs `sanity` and `fullctx`.
-- `outcome`: `pass`, `oom`, `timeout`, `server_crash`, `too_tight`, `parse_partial`, or `interrupted`.
+  run `near_full_ingest`; final-stage validation runs only `realistic`; `fullctx`
+  runs `sanity` and `fullctx`.
+- `outcome`: `pass`, `oom`, `timeout`, `server_crash`, `too_tight`,
+  `parse_partial`, `performance_degraded`, or `interrupted`.
 - `artifacts`: paths to `command.sh`, `server.log`, `telemetry.jsonl`, `request.json`, `response.json`, and `result.json`. `request.json` and `response.json` wrap all probe payloads in a `probes` array.
 - `note`: short human-readable note.
 
@@ -86,6 +93,7 @@ Each profile contains:
 - `peak_vram_mib`, `headroom_mib`
 - `risk`: `low`, `medium`, `high`, or `unknown` when VRAM was not measured.
 - `note`
+- `realistic_validation` when the profile came from final-stage validation.
 
 Profile ids may point at the same source run when one candidate is best for
 multiple roles. Exact commands are stored as argv plus a shell-escaped display
@@ -99,7 +107,8 @@ Markdown reports put the comparison table first:
 | Profile | Role | Output tok/s | Prompt tok/s | TTFT | Peak VRAM | Headroom | Risk | Validation | Command |
 |---|---|---:|---:|---:|---:|---:|---|---|---|
 
-`report --agent` prints one compact JSON object. `agent_schema_version` is the
+`report --agent` prints one compact JSON object. Agent schema version `2` adds
+`realistic_validation` to each metric. `agent_schema_version` is the
 stable contract version, separate from the profiler `schema_version`:
 
 - `best_profile_ids`: unambiguous `model-path#profile` keys.
@@ -133,4 +142,5 @@ profile:
 - `exact_command`, `environment_valid`, `telemetry_status`, `risk`, `failures`, `stale`
 - `output_toks_per_s`, `prompt_toks_per_s`, `ttft_ms`
 - `requested_context`, `validated_prompt_tokens`, `validation_level`
+- `realistic_validation`
 - `next_suggested_test`
