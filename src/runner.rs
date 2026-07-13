@@ -7,7 +7,7 @@ use crate::profile::{
     generate_candidates, generate_candidates_for_environment,
 };
 use crate::report;
-use crate::telemetry::TelemetrySampler;
+use crate::telemetry::{TelemetrySampler, TelemetrySummary};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use clap::ValueEnum;
@@ -121,6 +121,14 @@ struct RecommendValidation {
     stale: Vec<crate::profile::StaleRun>,
 }
 
+#[derive(Debug, Clone, Default)]
+enum TelemetrySource {
+    #[default]
+    Live,
+    #[cfg(test)]
+    Fixed(TelemetrySummary),
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum ProbeMode {
@@ -172,6 +180,7 @@ struct RunRequest {
     port: u16,
     prompt_plan: PromptPlan,
     probe_mode: ProbeMode,
+    telemetry_source: TelemetrySource,
 }
 
 #[derive(Debug, Clone)]
@@ -191,6 +200,14 @@ enum PromptPlan {
 }
 
 pub async fn run_tune(path: &Path, options: TuneOptions) -> Result<RecommendationFile> {
+    run_tune_with_telemetry(path, options, TelemetrySource::Live).await
+}
+
+async fn run_tune_with_telemetry(
+    path: &Path,
+    options: TuneOptions,
+    telemetry_source: TelemetrySource,
+) -> Result<RecommendationFile> {
     let model_path = resolve_model_path(path)?;
     let metadata = read_metadata(&model_path)?;
     let requested_context = metadata.context_or(options.ctx_cap);
@@ -279,6 +296,7 @@ pub async fn run_tune(path: &Path, options: TuneOptions) -> Result<Recommendatio
                 }),
             },
             probe_mode: options.probe_mode,
+            telemetry_source: telemetry_source.clone(),
         };
         let validation_level = if options.preset == Preset::Quick {
             ValidationLevel::Smoke
@@ -314,6 +332,7 @@ pub async fn run_tune(path: &Path, options: TuneOptions) -> Result<Recommendatio
         &environment,
         &current_results,
         completed,
+        &telemetry_source,
     )
     .await?;
 
@@ -335,6 +354,7 @@ pub async fn run_tune(path: &Path, options: TuneOptions) -> Result<Recommendatio
             &environment,
             validation_candidates,
             completed.saturating_add(5),
+            &telemetry_source,
         )
         .await?;
     }
@@ -364,6 +384,7 @@ async fn run_thread_refinement(
     environment: &EnvironmentSnapshot,
     primary_results: &[ProfileResult],
     completed_primary_runs: usize,
+    telemetry_source: &TelemetrySource,
 ) -> Result<Option<ProfileResult>> {
     if !capabilities.supports("--threads") || !capabilities.supports("--threads-batch") {
         eprintln!("thread refinement skipped: llama-server does not expose both thread flags");
@@ -426,6 +447,7 @@ async fn run_thread_refinement(
                     near_full_ingest_tokens: None,
                 },
                 probe_mode: options.probe_mode,
+                telemetry_source: telemetry_source.clone(),
             },
             &options.safety,
             options.gpu_index,
@@ -458,6 +480,7 @@ async fn run_realistic_validation(
     environment: &EnvironmentSnapshot,
     mut candidates: Vec<ProfileResult>,
     port_offset: usize,
+    telemetry_source: &TelemetrySource,
 ) -> Result<()> {
     candidates.sort_by(|left, right| {
         balanced_throughput(right)
@@ -504,6 +527,7 @@ async fn run_realistic_validation(
                     timeout,
                 },
                 probe_mode: options.probe_mode,
+                telemetry_source: telemetry_source.clone(),
             },
             &options.safety,
             options.gpu_index,
@@ -1033,6 +1057,7 @@ pub async fn run_fullctx(path: &Path, options: FullCtxOptions) -> Result<Profile
             target_tokens: options.target_tokens,
         },
         probe_mode: options.probe_mode,
+        telemetry_source: TelemetrySource::Live,
     };
     let result = run_candidate(
         &metadata,
@@ -1292,12 +1317,19 @@ async fn run_candidate(
         }
     };
 
-    let sampler = TelemetrySampler::start(
-        server.pid,
-        &artifacts.telemetry_jsonl,
-        gpu_index,
-        TELEMETRY_INTERVAL,
-    );
+    let sampler = match &request.telemetry_source {
+        TelemetrySource::Live => Some(TelemetrySampler::start(
+            server.pid,
+            &artifacts.telemetry_jsonl,
+            gpu_index,
+            TELEMETRY_INTERVAL,
+        )),
+        #[cfg(test)]
+        TelemetrySource::Fixed(_) => {
+            fs::write(&artifacts.telemetry_jsonl, "")?;
+            None
+        }
+    };
     let base_url = format!("http://127.0.0.1:{}/v1", request.port);
     let run_started = Instant::now();
     let drive_result = tokio::select! {
@@ -1334,7 +1366,12 @@ async fn run_candidate(
     }
 
     server.terminate().await;
-    let telemetry = sampler.stop().await;
+    let telemetry = match (sampler, &request.telemetry_source) {
+        (Some(sampler), _) => sampler.stop().await,
+        #[cfg(test)]
+        (None, TelemetrySource::Fixed(summary)) => summary.clone(),
+        (None, TelemetrySource::Live) => TelemetrySummary::default(),
+    };
     let ended_at = Utc::now();
     let log_text = fs::read_to_string(&artifacts.server_log).unwrap_or_default();
     if !matches!(outcome, Outcome::Interrupted) && log_indicates_oom(&log_text) {
@@ -2885,7 +2922,7 @@ llama_perf_context_print:        prompt eval time =   1000.00 ms / 16000 tokens 
         unsafe {
             std::env::set_var("LLAMA_SERVER", &server_path);
         }
-        let recs = run_tune(
+        let recs = run_tune_with_telemetry(
             &model_path,
             TuneOptions {
                 ctx_cap: None,
@@ -2901,6 +2938,16 @@ llama_perf_context_print:        prompt eval time =   1000.00 ms / 16000 tokens 
                 validate_best: true,
                 probe_mode: ProbeMode::Thinking,
             },
+            TelemetrySource::Fixed(TelemetrySummary {
+                peak_vram_mib: Some(4_096),
+                min_free_vram_mib: Some(4_096),
+                ram_available_min_mib: Some(16_384),
+                swap_start_mib: Some(0),
+                swap_end_mib: Some(0),
+                swap_delta_mib: Some(0),
+                sample_count: 1,
+                ..TelemetrySummary::default()
+            }),
         )
         .await
         .unwrap();
