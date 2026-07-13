@@ -25,9 +25,9 @@ enum Commands {
     Scan(ScanArgs),
     /// Inspect GGUF metadata and saved profiler state.
     Inspect(InspectArgs),
-    /// Run bounded llama-server tuning probes.
+    /// Search bounded llama-server candidates and save the best observed configurations.
     Tune(TuneArgs),
-    /// Run tuning, then print the recommended server command.
+    /// Run bounded tuning, then print a best observed server configuration.
     Recommend(RecommendArgs),
     /// Run an explicit near-full-context TTFT and stability probe.
     Fullctx(FullCtxArgs),
@@ -84,7 +84,7 @@ struct TuneArgs {
     /// Override the near-full ingest target token estimate.
     #[arg(long)]
     near_full_target_tokens: Option<u64>,
-    /// Validate the selected winner with a long prompt and up to 1024 output tokens.
+    /// Validate the selected observed candidate with a long prompt and up to 1024 output tokens.
     #[arg(long)]
     validate_best: bool,
     /// Print the candidate plan as JSON and do not start llama-server.
@@ -127,7 +127,7 @@ struct RecommendArgs {
     /// Override the near-full ingest target token estimate.
     #[arg(long)]
     near_full_target_tokens: Option<u64>,
-    /// Validate the selected winner with a long prompt and up to 1024 output tokens.
+    /// Validate the selected observed candidate with a long prompt and up to 1024 output tokens.
     #[arg(long)]
     validate_best: bool,
     /// Emit compact JSON for agents instead of human text.

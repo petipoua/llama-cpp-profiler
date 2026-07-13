@@ -399,7 +399,7 @@ pub fn build_recommendations_for_model(
     if let Some(result) = best_by(&usable, generation_score) {
         profiles.push(to_recommendation(
             "interactive-fast",
-            "Fastest observed generation throughput within safety limits",
+            "Best observed configuration for generation throughput within safety limits",
             result,
             safety,
         ));
@@ -413,7 +413,7 @@ pub fn build_recommendations_for_model(
     if let Some(result) = best_by(&safe, generation_score) {
         profiles.push(to_recommendation(
             "interactive-safe",
-            "Fastest observed generation throughput with at least 1 GiB free VRAM",
+            "Best observed configuration for generation throughput with at least 1 GiB free VRAM",
             result,
             safety,
         ));
@@ -422,7 +422,7 @@ pub fn build_recommendations_for_model(
     if let Some(result) = best_by(&usable, prompt_score) {
         profiles.push(to_recommendation(
             "prompt-replay",
-            "Fastest observed prompt ingest throughput within safety limits",
+            "Best observed configuration for prompt ingest throughput within safety limits",
             result,
             safety,
         ));
@@ -431,7 +431,7 @@ pub fn build_recommendations_for_model(
     if let Some(result) = best_by(&usable, balanced_score) {
         profiles.push(to_recommendation(
             "balanced",
-            "Best observed balance of prompt and output throughput",
+            "Best observed configuration for balanced prompt and output throughput",
             result,
             safety,
         ));

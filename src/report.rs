@@ -75,7 +75,10 @@ pub fn print_report(root: &Path, options: ReportOptions) -> Result<()> {
     }
 
     if profiled.is_empty() {
-        println!("No profiler recommendations found under {}", root.display());
+        println!(
+            "No best observed configurations found under {}",
+            root.display()
+        );
         return Ok(());
     }
 
@@ -337,7 +340,7 @@ pub fn update_opencode_json(existing: &str, entries: &[(String, String, u64)]) -
 
 pub fn markdown_for_recommendations(recommendations: &RecommendationFile) -> String {
     let mut lines = Vec::new();
-    lines.push("# llama.cpp profiler recommendations".to_string());
+    lines.push("# llama.cpp profiler best observed configurations".to_string());
     lines.push(String::new());
     lines.push(format!("Model: `{}`", recommendations.model_path.display()));
     lines.push(String::new());

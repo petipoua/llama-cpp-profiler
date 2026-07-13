@@ -402,7 +402,7 @@ async fn run_thread_refinement(
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
     else {
-        eprintln!("thread refinement skipped: no usable primary winner");
+        eprintln!("thread refinement skipped: no usable primary candidate was observed");
         return Ok(None);
     };
 
@@ -503,7 +503,7 @@ async fn run_realistic_validation(
         let mut candidate = baseline.candidate.clone();
         candidate.id = format!("{}-realistic-validation", candidate.id);
         candidate.note = format!(
-            "Final-stage realistic validation of {} with about {} prompt tokens and up to {} output tokens",
+            "Final-stage realistic validation of selected observed candidate {} with about {} prompt tokens and up to {} output tokens",
             baseline.candidate.id, target_tokens, REALISTIC_OUTPUT_TOKENS
         );
         eprintln!(
@@ -789,7 +789,7 @@ fn accept_thread_refinement(
     let best_score = balanced_throughput(best);
     if !thread_improvement_is_significant(baseline_score, best_score) {
         eprintln!(
-            "thread refinement: retained llama.cpp defaults (best explicit balanced score {:.2}, baseline {:.2})",
+            "thread refinement: retained llama.cpp defaults (highest observed explicit balanced score {:.2}, baseline {:.2})",
             best_score, baseline_score
         );
         return Ok(None);
@@ -858,7 +858,7 @@ pub async fn run_recommend(path: &Path, options: RecommendOptions) -> Result<Rec
         .is_current();
     if !options.agent {
         eprintln!(
-            "selected {} from {}; output {:?} tok/s, prompt {:?} tok/s",
+            "best observed profile {} from {}; output {:?} tok/s, prompt {:?} tok/s",
             profile.id,
             profile.source_candidate_id,
             profile.output_toks_per_s,
