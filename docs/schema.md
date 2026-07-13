@@ -95,10 +95,10 @@ Each profile contains:
 - `note`
 - `realistic_validation` when the profile came from final-stage validation.
 
-Profile ids may point at the same source run when one candidate is best for
-multiple roles. Exact commands are stored as argv plus a shell-escaped display
-string; `serve --port` rewrites the saved `--port` value before running or
-printing the command.
+Profile ids may point at the same source run when one candidate is the best
+observed configuration for multiple roles. Exact commands are stored as argv
+plus a shell-escaped display string; `serve --port` rewrites the saved `--port`
+value before running or printing the command.
 
 ## Reports
 
@@ -107,11 +107,17 @@ Markdown reports put the comparison table first:
 | Profile | Role | Output tok/s | Prompt tok/s | TTFT | Peak VRAM | Headroom | Risk | Validation | Command |
 |---|---|---:|---:|---:|---:|---:|---|---|---|
 
+Interactive `tune` output ends with a concise summary of the selected
+`interactive-fast` profile (or the first available profile), including generation
+and prompt throughput, requested context, VRAM headroom, and a shell-escaped
+`llama-cpp-profiler serve ... --profile ... --print` command.
+
 `report --agent` prints one compact JSON object. Agent schema version `2` adds
 `realistic_validation` to each metric. `agent_schema_version` is the
 stable contract version, separate from the profiler `schema_version`:
 
-- `best_profile_ids`: unambiguous `model-path#profile` keys.
+- `best_profile_ids`: unambiguous `model-path#profile` keys for the best observed
+  profiles.
 - `exact_command`
 - `confidence`: `low`, `medium`, or `high` for the top command
 - `key_metrics`

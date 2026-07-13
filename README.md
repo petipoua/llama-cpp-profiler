@@ -26,7 +26,8 @@ llama-cpp-profiler scan ~/Models
 llama-cpp-profiler inspect ~/Models/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive --json
 ```
 
-Run a bounded tuning pass and print the best saved server command:
+Run a bounded tuning pass and print the best observed configuration plus the
+exact next `serve` command:
 
 ```bash
 llama-cpp-profiler tune ~/Models/Qwopus3.6-35B-A3B-Coder-MTP --preset quick --max-runs 2
@@ -72,10 +73,11 @@ llama-cpp-profiler tune ~/Models/<model-or-gguf> --preset standard
 runs sanity/output/ingest probes, writes raw artifacts, and stops the server after
 each candidate. It can promote safer or more aggressive already-planned
 candidates from observed results, but stays within the selected preset or
-`--max-runs` primary-search budget. After that search, a winning placement with
-meaningful CPU work triggers up to five additional topology-aware thread
-refinement runs. Fully GPU-resident winners skip this stage. Tuning does not run
-a 250k-token prompt. `standard` and `thorough` then validate the best candidate
+`--max-runs` primary-search budget. After that search, the best observed
+placement with meaningful CPU work triggers up to five additional topology-aware
+thread refinement runs. Fully GPU-resident selections skip this stage. Tuning
+does not run a 250k-token prompt. `standard` and `thorough` then validate the
+best observed candidate
 with one realistic combined request: roughly 25% of context (bounded to 16k–64k
 input tokens, with output space reserved) and up to 1024 output tokens. This
 final validation is outside the primary-search and thread-refinement budgets.
@@ -99,11 +101,11 @@ set:
 llama-cpp-profiler tune ~/Models/<model-or-gguf> --preset quick --validate-best
 ```
 
-The final stage scales its timeout from the winner's short-probe throughput and
-tries the next balanced candidate after a crash, timeout, safety violation, or
-severe retained-throughput collapse. Early EOS is recorded as incomplete but
-still passes. Reports show actual prompt/output token counts and retained prompt
-and generation throughput.
+The final stage scales its timeout from the selected candidate's short-probe
+throughput and tries the next balanced candidate after a crash, timeout, safety
+violation, or severe retained-throughput collapse. Early EOS is recorded as
+incomplete but still passes. Reports show actual prompt/output token counts and
+retained prompt and generation throughput.
 
 Use `--probe-mode generic` to omit reasoning-specific server arguments and request
 fields. Thinking mode remains the default.
@@ -201,13 +203,14 @@ llama-cpp-profiler export PATH [--markdown] [--opencode PATH] [--dry-run] [--wri
   are available for adaptive promotion after failed or too-tight runs.
 - Safety defaults are `--min-vram-free-mib 512` and `--max-swap-delta-mib 1024`.
 - `quick` runs at most 6 candidates; `standard` runs at most 16; `thorough` runs a broader sweep.
-- These limits apply to the primary placement search. A CPU-participating winner
-  can add up to five thread-refinement runs: llama.cpp defaults, half/all physical
-  cores, physical/logical splits, and all logical cores. Duplicate pairs are
-  removed on smaller systems, and an explicit pair replaces the default only at
-  a measured balanced-throughput improvement of at least 3%.
+- These limits apply to the primary placement search. A CPU-participating
+  selected candidate can add up to five thread-refinement runs: llama.cpp
+  defaults, half/all physical cores, physical/logical splits, and all logical
+  cores. Duplicate pairs are removed on smaller systems, and an explicit pair
+  replaces the default only at a measured balanced-throughput improvement of at
+  least 3%.
 - `standard` and `thorough` add final-stage realistic validation after thread
-  refinement. `quick` adds it only with `--validate-best`. Failed winners fall
+  refinement. `quick` adds it only with `--validate-best`. Failed candidates fall
   back in balanced-score order; a failed validation disqualifies its short-probe
   baseline from recommendations.
 - Plain `tune` and `recommend` default to `quick`; `standard` and `thorough` are explicit deeper modes.
@@ -219,7 +222,7 @@ llama-cpp-profiler export PATH [--markdown] [--opencode PATH] [--dry-run] [--wri
   explicit partial-MoE candidates, for example `32,31,30`.
 - `fullctx` targets near-full prompts by default. `tune` and `recommend` can run
   one optional near-full ingest probe with `--near-full-ingest`.
-- Stale or legacy runs are excluded from best-profile selection by default.
+- Stale or legacy runs are excluded from best-observed-profile selection by default.
 - Export is dry-run unless `--write` is present.
 - `LLAMA_SERVER=/path/to/llama-server` overrides the executable used for
   `tune`, `fullctx`, `serve`, and `doctor`.
@@ -254,13 +257,14 @@ whether generation ended before the 1024-token ceiling.
 
 ### Profiles
 
-Recommendations are derived from current-environment passed runs and safety
-limits:
+Recommendations are the best observed configurations derived from
+current-environment passed runs and safety limits:
 
-- `interactive-fast`: highest generation tok/s within safety limits.
-- `interactive-safe`: highest generation tok/s with at least 1 GiB free VRAM.
-- `prompt-replay`: highest prompt eval tok/s.
-- `balanced`: harmonic mean of prompt and output throughput.
+- `interactive-fast`: best observed generation throughput within safety limits.
+- `interactive-safe`: best observed generation throughput with at least 1 GiB
+  free VRAM.
+- `prompt-replay`: best observed prompt eval throughput within safety limits.
+- `balanced`: best observed harmonic mean of prompt and output throughput.
 
 ### Requirements
 

@@ -10,6 +10,9 @@ First focused beta release for Linux `llama-server` profiling.
 - Keeps runtime fit and speed as the only recommendation claims.
 - Makes missing NVIDIA telemetry explicit and preserves startup, timeout, OOM, and interruption evidence.
 - Adds conditional CPU thread refinement and final-stage realistic workload validation.
+- Makes the fake-server end-to-end test independent of live GPU load.
+- Labels bounded-search results as best observed configurations and prints a
+  concise end-of-tune summary with the exact next `serve` command.
 - Removes the misleading quality-based recommendation and documents multi-GPU/non-NVIDIA limitations.
 
 Known limitations: model intelligence is not evaluated; backend-specific sweeps,

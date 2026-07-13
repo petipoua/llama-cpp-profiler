@@ -5,25 +5,36 @@ minimal tool for humans and agents. The profiler should consistently describe
 its result as the best observed configuration from a bounded empirical search,
 not as a guaranteed global optimum.
 
-1. Fix the nondeterministic end-to-end test
+1. Fix the nondeterministic end-to-end test — implemented
 
    The fake-server test currently reads live GPU telemetry and can fail when the
    desktop has less than the default 512 MiB VRAM headroom. Inject deterministic
    fake telemetry or explicitly disable telemetry in the test so the test suite
    never depends on current machine load.
 
-2. Make release wording precise
+   Implemented with a test-only fixed telemetry source. Production tuning still
+   samples live telemetry, while the fake-server test injects deterministic VRAM,
+   RAM, and swap values through the normal safety path.
+
+2. Make release wording precise — implemented
 
    Use "best observed configuration" consistently in CLI output and
    documentation. Avoid claims that the profiler finds the absolute best
    configuration or maximizes every CPU, GPU, and VRAM parameter.
 
-3. Add a concise tuning summary
+   CLI help, generated Markdown, profile roles, and tuning diagnostics now call
+   results best observed configurations from the bounded search.
+
+3. Add a concise tuning summary — implemented
 
    At the end of `tune`, print the selected profile's generation throughput,
    prompt throughput, context, VRAM headroom, and the exact next `serve` command.
    The result should be immediately useful without requiring a separate
    `report` invocation.
+
+   `tune` now ends with the selected profile id, generation and prompt
+   throughput, context, VRAM headroom, and a shell-escaped `serve --print`
+   command.
 
 4. Report what was and was not searched
 
@@ -40,11 +51,11 @@ not as a guaranteed global optimum.
 
 6. Add final-stage realistic workload validation — implemented
 
-   After the normal search selects its winner, validate that candidate with one
-   combined long-prompt and sustained-generation request instead of making every
-   candidate more expensive. Use up to 1024 output tokens and a bounded input
-   target of `min(max(context / 4, 16k), 64k)` tokens. Scale the timeout from the
-   winner's measured prompt and generation throughput.
+   After the normal search selects its best observed candidate, validate it with
+   one combined long-prompt and sustained-generation request instead of making
+   every candidate more expensive. Use up to 1024 output tokens and a bounded
+   input target of `min(max(context / 4, 16k), 64k)` tokens. Scale the timeout
+   from the selected candidate's measured prompt and generation throughput.
 
    Enable this by default for `standard` and `thorough`, and keep it opt-in for
    `quick` through a flag such as `--validate-best`. Record the actual generated
@@ -54,9 +65,9 @@ not as a guaranteed global optimum.
 
    Compare the result with the short-probe baseline and report the retained
    performance ratio without initially enforcing a universal tok/s threshold. If
-   the winner crashes, times out, becomes unsafe, or severely degrades, mark it as
-   failing realistic validation and run the same validation against the next
-   ranked candidate.
+   the candidate crashes, times out, becomes unsafe, or severely degrades, mark
+   it as failing realistic validation and run the same validation against the
+   next ranked candidate.
 
    Implemented as a post-search stage enabled by default for `standard` and
    `thorough`, or by `--validate-best` for `quick`. It uses a context-bounded
@@ -81,10 +92,11 @@ not as a guaranteed global optimum.
    4. All physical cores for generation and all logical cores for prompt processing.
    5. All logical cores for both generation and prompt processing.
 
-   Treat these as refinements of the winning candidate rather than multiplying
+   Treat these as refinements of the selected candidate rather than multiplying
    every primary candidate by five. Prefer topology-aware core counts when the
    system exposes CPU or NUMA domains, record the exact tested values, and accept
-   a new winner only when its improvement is larger than normal benchmark noise.
+   a new selection only when its improvement is larger than normal benchmark
+   noise.
 
 8. Improve repeated-run reliability
 

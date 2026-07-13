@@ -27,7 +27,7 @@ is an optional adapter and receives the profile's validated context.
 Recommendations are environment-bound. If the OS/architecture, CPU identity or
 core count, RAM/swap totals, GPU backend, GPU inventory/driver, or
 `llama-server` executable/help output changes, old runs are kept as stale
-evidence and excluded from best-profile selection.
+evidence and excluded from best-observed-profile selection.
 
 ## Dense Models
 
@@ -57,7 +57,7 @@ starting servers.
 
 For MoE models, `tune` and `recommend` also accept `--n-cpu-moe-values` to put
 known expert-placement boundary values at the front of the plan. This is useful
-when prior runs or neighboring models show that the important local optimum is
+when prior runs or neighboring models show that the strongest observed region is
 around a narrow partial-MoE range such as `32,31,30`, and a bounded `quick` run
 should spend its budget there instead of on conservative baselines.
 
@@ -76,16 +76,16 @@ evidence: future agents should not retry the same aggressive settings blindly.
 
 ## Thread Refinement
 
-After the bounded placement search, the profiler selects its best balanced
-primary result. If that placement has CPU-resident MoE experts, explicit partial
-GPU offload, or a server log that reports only some layers offloaded, it runs a
-second-stage thread sweep. Fully GPU-resident winners and servers without both
-`--threads` and `--threads-batch` skip it.
+After the bounded placement search, the profiler selects its best observed
+balanced primary result. If that placement has CPU-resident MoE experts,
+explicit partial GPU offload, or a server log that reports only some layers
+offloaded, it runs a second-stage thread sweep. Fully GPU-resident selections and
+servers without both `--threads` and `--threads-batch` skip it.
 
-The sweep reruns the winner with llama.cpp defaults and up to four explicit,
-topology-derived pairs: half physical/all physical, all physical/all physical,
-all physical/all logical, and all logical/all logical. Duplicate pairs are
-removed. The contemporaneous default rerun is the baseline; an explicit pair is
+The sweep reruns the selected candidate with llama.cpp defaults and up to four
+explicit, topology-derived pairs: half physical/all physical, all physical/all
+physical, all physical/all logical, and all logical/all logical. Duplicate pairs
+are removed. The contemporaneous default rerun is the baseline; an explicit pair is
 eligible for recommendations only when its harmonic mean of prompt and output
 throughput improves by at least 3%. All observations remain in the run artifacts.
 The primary `--max-runs` budget does not include these up to five refinement runs.
@@ -94,8 +94,8 @@ The primary `--max-runs` budget does not include these up to five refinement run
 
 After placement search and any accepted thread refinement, `standard` and
 `thorough` rank the current safe candidates by balanced throughput and validate
-the winner with one combined request. `quick` does this only with
-`--validate-best`. The prompt target is
+the best observed candidate with one combined request. `quick` does this only
+with `--validate-best`. The prompt target is
 `min(max(context / 4, 16k), 64k)`, reduced when necessary to reserve room for up
 to 1024 output tokens. The timeout is estimated from the baseline prompt and
 generation speeds, doubled for margin, given 120 seconds of startup/variance
@@ -143,12 +143,14 @@ server/request settings. `--probe-mode generic` omits those settings.
 
 ## Scoring
 
-Profiles are selected from observed runs that pass safety limits:
+Profiles are the best observed configurations among runs that pass safety
+limits:
 
-- `interactive-fast`: maximize generation speed.
-- `interactive-safe`: maximize generation speed with at least 1 GiB free VRAM.
-- `prompt-replay`: maximize prompt ingest speed.
-- `balanced`: maximize harmonic mean of generation and prompt ingest speed.
+- `interactive-fast`: best observed generation speed.
+- `interactive-safe`: best observed generation speed with at least 1 GiB free
+  VRAM.
+- `prompt-replay`: best observed prompt ingest speed.
+- `balanced`: best observed harmonic mean of generation and prompt ingest speed.
 
 Rejected runs keep a compact reason: OOM, timeout, server crash, too-tight VRAM
 or swap use, severe realistic-validation degradation, interrupted, or
