@@ -412,6 +412,41 @@ pub fn markdown_for_recommendations(recommendations: &RecommendationFile) -> Str
     lines.join("\n")
 }
 
+pub fn tune_summary(recommendations: &RecommendationFile) -> String {
+    let Some(profile) = recommendations
+        .profiles
+        .iter()
+        .find(|profile| profile.id == "interactive-fast")
+        .or_else(|| recommendations.profiles.first())
+    else {
+        return "## Tune summary\n\nNo usable best observed configuration was produced."
+            .to_string();
+    };
+    let serve_command = crate::profile::command_display(&[
+        "llama-cpp-profiler".to_string(),
+        "serve".to_string(),
+        recommendations.model_path.to_string_lossy().into_owned(),
+        "--profile".to_string(),
+        profile.id.clone(),
+        "--print".to_string(),
+    ]);
+    format!(
+        "## Tune summary\n\n\
+         - Selected profile: `{}`\n\
+         - Generation throughput: {} tok/s\n\
+         - Prompt throughput: {} tok/s\n\
+         - Context: {} tokens\n\
+         - VRAM headroom: {}\n\
+         - Next serve command: `{}`",
+        profile.id,
+        fmt_f64(profile.output_toks_per_s),
+        fmt_f64(profile.prompt_toks_per_s),
+        profile.requested_context,
+        fmt_mib(profile.headroom_mib),
+        serve_command,
+    )
+}
+
 fn print_agent_report(profiled: &[(GgufMetadata, RecommendationFile)]) -> Result<()> {
     let mut all_profiles = Vec::new();
     let mut failures = Vec::new();
@@ -855,6 +890,15 @@ mod tests {
             environment_valid: false,
             next_suggested_test: None,
         };
+        let summary = tune_summary(&recommendations);
+        assert!(summary.contains("Selected profile: `interactive-fast`"));
+        assert!(summary.contains("Generation throughput: 1.00 tok/s"));
+        assert!(summary.contains("Prompt throughput: 1.00 tok/s"));
+        assert!(summary.contains("Context: 8192 tokens"));
+        assert!(summary.contains("VRAM headroom: 1 MiB"));
+        assert!(summary.contains(
+            "llama-cpp-profiler serve /models/test.gguf --profile interactive-fast --print"
+        ));
         let entries = opencode_entries(&[(metadata, recommendations)]);
         assert_eq!(entries[0].2, 8192);
     }

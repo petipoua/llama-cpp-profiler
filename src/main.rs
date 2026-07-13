@@ -288,7 +288,8 @@ async fn main() -> Result<()> {
             )
             .await?;
             if !plan_only {
-                println!("{}", report::markdown_for_recommendations(&recs));
+                print!("{}", report::markdown_for_recommendations(&recs));
+                println!("{}", report::tune_summary(&recs));
             }
         }
         Commands::Recommend(args) => {
