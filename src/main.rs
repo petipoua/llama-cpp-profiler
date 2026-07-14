@@ -153,8 +153,9 @@ struct FullCtxArgs {
     path: PathBuf,
     #[arg(long, default_value = "interactive-fast")]
     profile: String,
-    #[arg(long, default_value_t = 250_000)]
-    target_tokens: u64,
+    /// Override the default prompt target of 80% of the active server context.
+    #[arg(long)]
+    target_tokens: Option<u64>,
     #[arg(long)]
     ctx: Option<u64>,
     #[arg(long, value_enum, default_value_t = ProbeMode::Thinking)]

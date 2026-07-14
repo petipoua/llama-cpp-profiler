@@ -5,6 +5,9 @@
 speed—context, throughput, TTFT, memory headroom, and failures—not intelligence,
 coding quality, or model alignment.
 
+It is designed primarily for consumer Linux systems with a single GPU. It is
+not a multi-GPU tuning or placement tool.
+
 The core tool is about `llama.cpp` server behavior. Client harnesses such as
 opencode are optional export adapters because they only call the OpenAI-compatible
 endpoint; they do not choose or load the GGUF.
@@ -91,8 +94,10 @@ input tokens, with output space reserved) and up to 1024 output tokens. This
 final validation is outside the primary-search and thread-refinement budgets.
 
 Use `--confirm-best` when repeatability matters. It reruns up to three promising
-candidates and ranks confirmed candidates by median throughput, reducing noise
-from clock changes, cache warming, and background desktop activity.
+candidates and ranks them by median throughput before final-stage validation.
+The selected realistic-validation result retains the repeated-measurement count
+and `confirmed` confidence, reducing noise from clock changes, cache warming,
+and background desktop activity.
 
 The default `thinking` probe mode keeps the reasoning-oriented baseline:
 generated server commands and chat probes use `--reasoning on`,
@@ -155,11 +160,13 @@ llama-cpp-profiler doctor --json
 Run explicit near-full context:
 
 ```bash
-llama-cpp-profiler fullctx ~/Models/<model-or-gguf> --profile interactive-fast --target-tokens 250000
+llama-cpp-profiler fullctx ~/Models/<model-or-gguf> --profile interactive-fast
 ```
 
-This is intentionally separate from `tune` because near-full prompts can take many
-minutes and put real pressure on VRAM, RAM, and swap.
+The default prompt target is 80% of the active profile's server context. Use
+`--target-tokens` to request a different target; it is capped below the active
+context. This is intentionally separate from `tune` because long prompts can
+take many minutes and put real pressure on VRAM, RAM, and swap.
 
 Read ranked recommendations:
 
@@ -227,7 +234,9 @@ llama-cpp-profiler export PATH [--markdown] [--opencode PATH] [--dry-run] [--wri
   baseline from recommendations.
 - Plain `tune` and `recommend` default to `quick`; `standard` and `thorough` are explicit deeper modes.
 - `--goal balanced` is the default. It places the matching `balanced`, `interactive-fast`, or `prompt-replay` profile first in tune output; `recommend` uses that primary profile unless `--profile` is explicit.
-- `--confirm-best` reruns up to three safe, promising candidates and uses median measurements for confirmed ranking.
+- `--confirm-best` reruns up to three safe, promising candidates, uses median
+  measurements to select final-stage validation candidates, and preserves the
+  repeated-measurement count in the eventual recommendation.
 - Confidence is `provisional` for smoke evidence, `benchmarked` after standard/realistic validation, `confirmed` after repeated measurements, and `full-context-validated` after `fullctx`.
 - `thinking` is the default probe mode; `generic` omits reasoning-specific arguments and request fields.
 - `quick` runs are labeled `smoke`; normal `standard` and `thorough` probes are
@@ -235,8 +244,10 @@ llama-cpp-profiler export PATH [--markdown] [--opencode PATH] [--dry-run] [--wri
   runs are labeled `fullctx`.
 - `--n-cpu-moe-values` is a comma-separated MoE-only override that prepends
   explicit partial-MoE candidates, for example `32,31,30`.
-- `fullctx` targets near-full prompts by default. `tune` and `recommend` can run
-  one optional near-full ingest probe with `--near-full-ingest`.
+- `fullctx` targets 80% of the active profile's server context by default.
+  Explicit `--target-tokens` values are capped below that context. `tune` and
+  `recommend` can run one optional near-full ingest probe with
+  `--near-full-ingest`.
 - Stale or legacy runs are excluded from best-observed-profile selection by default.
 - Export is dry-run unless `--write` is present.
 - `LLAMA_SERVER=/path/to/llama-server` overrides the executable used for
@@ -289,9 +300,14 @@ current-environment passed runs and safety limits:
   `unknown`, and a profile cannot qualify as `interactive-safe`.
 - Optional: a client such as opencode that talks to `http://127.0.0.1:18080/v1`
 
-This beta supports Linux and `llama-server`. Multi-GPU placement is not fully
-optimized unless the selected server command explicitly controls placement;
-non-NVIDIA telemetry and backend-specific sweeps are limited or deferred.
+### License
+
+MIT. See [LICENSE-MIT](LICENSE-MIT).
+
+This beta supports Linux and `llama-server`, with consumer single-GPU setups as
+its primary target. Multi-GPU hardware may be detected, but the profiler does
+not model or optimize placement across GPUs; non-NVIDIA telemetry and
+backend-specific sweeps are limited or deferred.
 `fullctx` and the `standard`/`thorough` presets can be expensive and may pressure
 VRAM, RAM, and swap.
 

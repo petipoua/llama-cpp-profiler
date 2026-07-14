@@ -2,7 +2,7 @@
 name = "llama-cpp-profiler"
 version = "0.1.0-beta.1"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 description = "Empirical llama.cpp GGUF profiler with agent-readable reports"
 repository = "https://github.com/petipoua/llama-cpp-profiler"
 readme = "README.md"

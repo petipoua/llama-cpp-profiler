@@ -3,6 +3,9 @@
 `llama-cpp-profiler` profiles runtime fit and speed. It does not benchmark model
 intelligence, coding quality, or alignment behavior.
 
+The profiling strategy targets consumer Linux systems with a single GPU. It is
+not intended to optimize model placement across multiple GPUs.
+
 ## General Evidence
 
 The profiler records evidence that applies to any `llama-server` client:
@@ -95,7 +98,10 @@ The primary `--max-runs` budget does not include these up to five refinement run
 After placement search and any accepted thread refinement, `standard` and
 `thorough` rank the current safe candidates by balanced throughput and validate
 the best observed candidate with one combined request. `quick` does this only
-with `--validate-best`. The prompt target is
+with `--validate-best`. When `--confirm-best` is enabled, confirmation runs are
+combined with their baseline by median throughput before this ranking, and the
+eventual validated recommendation retains the repeated-measurement count. The
+prompt target is
 `min(max(context / 4, 16k), 64k)`, reduced when necessary to reserve room for up
 to 1024 output tokens. The timeout is estimated from the baseline prompt and
 generation speeds, doubled for margin, given 120 seconds of startup/variance
@@ -117,7 +123,7 @@ context probe automatically. Its probes are:
 
 - `sanity`: tiny answer, `max_tokens = 1`.
 - `output`: small prompt, 128 generated tokens.
-- `ingest`: repeated Apache-2.0 prompt around 16k tokens for `quick` and 64k for broader presets.
+- `ingest`: repeated MIT license prompt around 16k tokens for `quick` and 64k for broader presets.
 
 `quick` results are labeled with smoke validation even though the ingest probe is
 still run at the smaller 16k-token target. `standard` and `thorough` results are
@@ -130,12 +136,13 @@ requested context. The default target is about 94% of the requested context, so 
 from normal tuning because it can take substantially longer.
 
 `fullctx` is explicit opt-in and sends a sanity probe followed by the near-full
-prompt probe, defaulting to about 250k target tokens and `max_tokens = 1`. It
-exists for TTFT and stability checks, not for normal tuning.
+prompt probe, defaulting to 80% of the active profile's server context and
+`max_tokens = 1`. An explicit `--target-tokens` value is capped below that
+context. It exists for TTFT and stability checks, not for normal tuning.
 
 Prompt token counts prefer server timing lines in `server.log`. Prompt
-generation uses `/usr/share/licenses/spdx/Apache-2.0.txt` when available, with a
-bundled Apache-2.0 fixture as fallback, so runs are deterministic and independent
+generation uses `/usr/share/licenses/spdx/MIT.txt` when available, with the
+project's MIT license text as fallback, so runs are deterministic and independent
 of network access.
 
 Thinking mode is the default probe behavior and includes reasoning-specific
@@ -162,5 +169,7 @@ timing lines were missing.
 Legacy, changed-model, or changed-environment runs are listed separately as
 stale. They are never used for scoring. Missing NVIDIA telemetry leaves safety
 unknown; such profiles may be ranked for speed but cannot be `interactive-safe`.
-This beta supports Linux and `llama-server`; multi-GPU placement and non-NVIDIA
-backend optimization remain limited or deferred.
+This beta supports Linux and `llama-server`, primarily on consumer single-GPU
+systems. Multi-GPU hardware may be recorded in the environment snapshot, but
+placement across GPUs is not modeled or optimized. Non-NVIDIA backend
+optimization remains limited or deferred.

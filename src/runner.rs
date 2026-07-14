@@ -57,7 +57,7 @@ pub struct TuneOptions {
 #[derive(Debug, Clone)]
 pub struct FullCtxOptions {
     pub profile: String,
-    pub target_tokens: u64,
+    pub target_tokens: Option<u64>,
     pub ctx_cap: Option<u64>,
     pub safety: SafetyLimits,
     pub port_start: u16,
@@ -284,7 +284,7 @@ async fn run_tune_with_telemetry(
         if !seen.insert(candidate.id.clone()) {
             continue;
         }
-        let port = find_open_port(options.port_start + completed as u16)?;
+        let port = find_open_port(port_with_offset(options.port_start, completed)?)?;
         eprintln!(
             "[{}/{}] {} on port {}",
             completed + 1,
@@ -345,7 +345,7 @@ async fn run_tune_with_telemetry(
     )
     .await?;
 
-    let confirmation_runs = if options.confirm_best {
+    let confirmation_results = if options.confirm_best {
         run_confirmation_runs(
             &metadata,
             &capabilities,
@@ -357,8 +357,9 @@ async fn run_tune_with_telemetry(
         )
         .await?
     } else {
-        0
+        Vec::new()
     };
+    let confirmation_runs = confirmation_results.len();
 
     if options.preset != Preset::Quick || options.validate_best {
         let mut validation_candidates = current_results
@@ -371,6 +372,11 @@ async fn run_tune_with_telemetry(
         if let Some(refined) = refined_winner.as_ref() {
             validation_candidates.push(refined.clone());
         }
+        validation_candidates.extend(confirmation_results.into_iter().filter(|result| {
+            result.outcome.is_usable() && !violates_safety(&result.metrics, &options.safety)
+        }));
+        let validation_candidates =
+            crate::profile::median_confirmed_measurements(validation_candidates.iter().collect());
         run_realistic_validation(
             &metadata,
             &capabilities,
@@ -420,7 +426,7 @@ async fn run_confirmation_runs(
     primary_results: &[ProfileResult],
     port_offset: usize,
     telemetry_source: &TelemetrySource,
-) -> Result<usize> {
+) -> Result<Vec<ProfileResult>> {
     let mut promising = primary_results
         .iter()
         .filter(|result| {
@@ -435,17 +441,17 @@ async fn run_confirmation_runs(
     promising.truncate(3);
     if promising.is_empty() {
         eprintln!("confirmation skipped: no safe candidate was observed");
-        return Ok(0);
+        return Ok(Vec::new());
     }
     eprintln!(
         "confirmation: rerunning {} promising candidates",
         promising.len()
     );
     let confirmation_count = promising.len();
+    let mut results = Vec::with_capacity(confirmation_count);
     for (index, baseline) in promising.into_iter().enumerate() {
-        let offset =
-            u16::try_from(port_offset.saturating_add(index)).context("confirmation port offset")?;
-        let port = find_open_port(options.port_start.saturating_add(offset))?;
+        let offset = port_offset.saturating_add(index);
+        let port = find_open_port(port_with_offset(options.port_start, offset)?)?;
         let result = run_candidate(
             metadata,
             capabilities,
@@ -477,8 +483,9 @@ async fn run_confirmation_runs(
             result.metrics.server_generation_toks_per_s,
             result.metrics.server_prompt_eval_toks_per_s,
         );
+        results.push(result);
     }
-    Ok(confirmation_count)
+    Ok(results)
 }
 
 fn search_coverage(
@@ -604,8 +611,7 @@ async fn run_thread_refinement(
     let mut refinement_results = Vec::new();
     for (index, candidate) in thread_candidates.into_iter().enumerate() {
         let port_offset = completed_primary_runs.saturating_add(index);
-        let port_offset = u16::try_from(port_offset).context("thread refinement port offset")?;
-        let port = find_open_port(options.port_start.saturating_add(port_offset))?;
+        let port = find_open_port(port_with_offset(options.port_start, port_offset)?)?;
         eprintln!(
             "  [threads {}/{}] {} on port {}",
             index + 1,
@@ -675,9 +681,8 @@ async fn run_realistic_validation(
     for (index, baseline) in candidates.into_iter().enumerate() {
         let target_tokens = realistic_validation_prompt_target(baseline.requested_context);
         let timeout = realistic_validation_timeout(&baseline, target_tokens);
-        let offset = u16::try_from(port_offset.saturating_add(index))
-            .context("realistic validation port offset")?;
-        let port = find_open_port(options.port_start.saturating_add(offset))?;
+        let offset = port_offset.saturating_add(index);
+        let port = find_open_port(port_with_offset(options.port_start, offset)?)?;
         let mut candidate = baseline.candidate.clone();
         candidate.id = format!("{}-realistic-validation", candidate.id);
         candidate.note = format!(
@@ -1237,13 +1242,12 @@ pub async fn run_fullctx(path: &Path, options: FullCtxOptions) -> Result<Profile
 
     fs::create_dir_all(metadata.profiler_dir().join("runs"))?;
     fs::create_dir_all(metadata.profiler_dir().join("reports"))?;
+    let target_tokens = fullctx_prompt_target(candidate.requested_context, options.target_tokens);
     let request = RunRequest {
         test_kind: "fullctx".to_string(),
         candidate,
         port: find_open_port(options.port_start)?,
-        prompt_plan: PromptPlan::FullCtx {
-            target_tokens: options.target_tokens,
-        },
+        prompt_plan: PromptPlan::FullCtx { target_tokens },
         probe_mode: options.probe_mode,
         telemetry_source: TelemetrySource::Live,
     };
@@ -2338,8 +2342,21 @@ fn violates_safety(metrics: &crate::profile::RunMetrics, safety: &SafetyLimits) 
             .is_some_and(|delta| delta > safety.max_swap_delta_mib as i64)
 }
 
+fn port_with_offset(start: u16, offset: usize) -> Result<u16> {
+    if start == 0 {
+        bail!("--port-start must be between 1 and 65535");
+    }
+    let offset = u16::try_from(offset).context("port offset exceeds u16")?;
+    start
+        .checked_add(offset)
+        .context("port range exceeds 65535")
+}
+
 fn find_open_port(start: u16) -> Result<u16> {
-    for port in start..start.saturating_add(1000) {
+    if start == 0 {
+        bail!("--port-start must be between 1 and 65535");
+    }
+    for port in start..=start.saturating_add(999) {
         if TcpListener::bind(("127.0.0.1", port)).is_ok() {
             return Ok(port);
         }
@@ -2491,8 +2508,8 @@ fn run_id(candidate_id: &str) -> String {
 }
 
 fn repeated_license_prompt(target_tokens: u64) -> (String, u64) {
-    let source = fs::read_to_string("/usr/share/licenses/spdx/Apache-2.0.txt")
-        .unwrap_or_else(|_| include_str!("../fixtures/Apache-2.0.txt").to_string());
+    let source = fs::read_to_string("/usr/share/licenses/spdx/MIT.txt")
+        .unwrap_or_else(|_| include_str!("../LICENSE-MIT").to_string());
     let source_tokens = estimate_tokens(&source).max(1);
     let repeats = (target_tokens / source_tokens).max(1) + 1;
     let mut prompt = String::with_capacity(source.len() * repeats as usize);
@@ -2506,8 +2523,8 @@ fn repeated_license_prompt(target_tokens: u64) -> (String, u64) {
 }
 
 fn repeated_realistic_prompt(target_tokens: u64) -> (String, u64) {
-    let source = fs::read_to_string("/usr/share/licenses/spdx/Apache-2.0.txt")
-        .unwrap_or_else(|_| include_str!("../fixtures/Apache-2.0.txt").to_string());
+    let source = fs::read_to_string("/usr/share/licenses/spdx/MIT.txt")
+        .unwrap_or_else(|_| include_str!("../LICENSE-MIT").to_string());
     let target_chars = usize::try_from(target_tokens.saturating_mul(4)).unwrap_or(usize::MAX);
     let instruction = "Analyze the following repeated license text. Produce a detailed, structured review of its obligations, permissions, risks, and practical compliance steps. Continue until the analysis is comprehensive.\n\n";
     let mut prompt = instruction.chars().take(target_chars).collect::<String>();
@@ -2531,6 +2548,13 @@ fn near_full_ingest_target(requested_context: u64) -> u64 {
     ratio_target
         .min(requested_context.saturating_sub(1024))
         .max(1)
+}
+
+fn fullctx_prompt_target(requested_context: u64, override_tokens: Option<u64>) -> u64 {
+    let maximum = requested_context.saturating_sub(1).max(1);
+    override_tokens
+        .unwrap_or_else(|| requested_context.saturating_mul(80) / 100)
+        .clamp(1, maximum)
 }
 
 fn estimate_tokens(text: &str) -> u64 {
@@ -2911,6 +2935,22 @@ llama_perf_context_print:        prompt eval time =   1000.00 ms / 16000 tokens 
         assert_eq!(realistic_validation_prompt_target(8_192), 7_168);
         let (_, estimate) = repeated_realistic_prompt(32_768);
         assert_eq!(estimate, 32_768);
+    }
+
+    #[test]
+    fn fullctx_defaults_to_eighty_percent_and_caps_explicit_targets() {
+        assert_eq!(fullctx_prompt_target(262_144, None), 209_715);
+        assert_eq!(fullctx_prompt_target(8_192, None), 6_553);
+        assert_eq!(fullctx_prompt_target(8_192, Some(4_096)), 4_096);
+        assert_eq!(fullctx_prompt_target(8_192, Some(250_000)), 8_191);
+    }
+
+    #[test]
+    fn port_offsets_reject_zero_and_overflow() {
+        assert!(port_with_offset(0, 0).is_err());
+        assert_eq!(port_with_offset(65_535, 0).unwrap(), 65_535);
+        assert!(port_with_offset(65_535, 1).is_err());
+        assert_eq!(port_with_offset(18_180, 5).unwrap(), 18_185);
     }
 
     #[test]

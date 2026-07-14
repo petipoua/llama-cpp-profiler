@@ -17,7 +17,8 @@ Preferred workflow for agents:
 5. Use `serve --profile interactive-fast --print` to get the exact server command.
 
 Avoid `fullctx` unless the user explicitly asks for near-full-context TTFT or
-stability. It can run for many minutes and pressure VRAM, RAM, and swap.
+stability. Its default prompt target is 80% of the active profile's server
+context, and it can run for many minutes and pressure VRAM, RAM, and swap.
 
 Do not hard-code this machine's model names or opencode ids into profiler logic.
 Machine-specific information belongs in generated reports or optional exports,

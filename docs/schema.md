@@ -1,9 +1,9 @@
 # Data Schemas
 
-The schemas are versioned by `schema_version`. Beta schema version `5` adds
-realistic-validation metadata and outcomes. Version `4` added optional candidate
-thread counts and thread-refinement run kinds. Version `3`
-added versioned model identity and validation fields. Earlier files are read
+The schemas are versioned by `schema_version`; the current beta schema version is
+`6`. Version `5` added realistic-validation metadata and outcomes. Version `4`
+added optional candidate thread counts and thread-refinement run kinds. Version
+`3` added versioned model identity and validation fields. Earlier files are read
 best-effort; files without model identity are retained as legacy stale evidence.
 
 ## `result.json`
@@ -28,10 +28,11 @@ Important fields:
 - `candidate.expected_risk`, `candidate.planning_note`: hardware-aware planning annotations.
 - Explicit MoE candidates requested with `--n-cpu-moe-values` are normal
   candidates in artifacts and plans. Their ids end in `-explicit`.
-- `test_kind`: `tune`, `fullctx`, `realistic-validation`, `thread-refinement`, or
-  `thread-refinement-observation`. The last kind records a tested pair that did
-  not clear the 3% balanced-throughput acceptance gate and is excluded from
-  recommendations.
+- `test_kind`: `tune`, `confirmation`, `fullctx`, `realistic-validation`,
+  `thread-refinement`, or `thread-refinement-observation`. Confirmation runs
+  repeat promising tune candidates for median ranking. The last kind records a
+  tested thread pair that did not clear the 3% balanced-throughput acceptance
+  gate and is excluded from recommendations.
 - `requested_context`: context passed to the server.
 - `validation_level`: serialized as `smoke`, `standard_ingest`, `realistic`, or
   `fullctx`; reports display `standard_ingest` as `standard-ingest`.
@@ -93,6 +94,9 @@ Each profile contains:
 - `command`, `command_display`: exact `llama-server` command.
 - `output_toks_per_s`, `prompt_toks_per_s`, `ttft_ms`
 - `peak_vram_mib`, `headroom_mib`
+- `confidence`, `measurement_count`: evidence label and number of repeated tune
+  measurements supporting the selected candidate. A realistic-validation
+  profile retains the count of its baseline candidate.
 - `risk`: `low`, `medium`, `high`, or `unknown` when VRAM was not measured.
 - `note`
 - `realistic_validation` when the profile came from final-stage validation.

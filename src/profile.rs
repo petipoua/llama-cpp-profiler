@@ -429,6 +429,7 @@ pub fn build_recommendations_for_model(
             model_identity.is_none_or(|identity| result.model_identity.as_ref() == Some(identity))
         })
         .collect();
+    let measurement_counts = confirmation_measurement_counts(&usable);
     let realistic: Vec<&ProfileResult> = usable
         .iter()
         .copied()
@@ -440,7 +441,6 @@ pub fn build_recommendations_for_model(
         realistic
     };
 
-    let measurement_counts = confirmation_measurement_counts(&usable);
     let usable = median_confirmed_measurements(usable);
     let usable = usable.iter().collect::<Vec<_>>();
 
@@ -450,10 +450,7 @@ pub fn build_recommendations_for_model(
             "Best observed configuration for generation throughput within safety limits",
             result,
             safety,
-            measurement_counts
-                .get(&result.candidate.id)
-                .copied()
-                .unwrap_or(1),
+            measurement_count_for(result, results, &measurement_counts),
         ));
     }
 
@@ -468,10 +465,7 @@ pub fn build_recommendations_for_model(
             "Best observed configuration for generation throughput with at least 1 GiB free VRAM",
             result,
             safety,
-            measurement_counts
-                .get(&result.candidate.id)
-                .copied()
-                .unwrap_or(1),
+            measurement_count_for(result, results, &measurement_counts),
         ));
     }
 
@@ -481,10 +475,7 @@ pub fn build_recommendations_for_model(
             "Best observed configuration for prompt ingest throughput within safety limits",
             result,
             safety,
-            measurement_counts
-                .get(&result.candidate.id)
-                .copied()
-                .unwrap_or(1),
+            measurement_count_for(result, results, &measurement_counts),
         ));
     }
 
@@ -494,10 +485,7 @@ pub fn build_recommendations_for_model(
             "Best observed configuration for balanced prompt and output throughput",
             result,
             safety,
-            measurement_counts
-                .get(&result.candidate.id)
-                .copied()
-                .unwrap_or(1),
+            measurement_count_for(result, results, &measurement_counts),
         ));
     }
 
@@ -588,7 +576,7 @@ fn confirmation_measurement_counts(results: &[&ProfileResult]) -> BTreeMap<Strin
     counts
 }
 
-fn median_confirmed_measurements(results: Vec<&ProfileResult>) -> Vec<ProfileResult> {
+pub(crate) fn median_confirmed_measurements(results: Vec<&ProfileResult>) -> Vec<ProfileResult> {
     let mut groups = BTreeMap::<String, Vec<&ProfileResult>>::new();
     for result in results {
         groups
@@ -638,6 +626,26 @@ fn median_confirmed_measurements(results: Vec<&ProfileResult>) -> Vec<ProfileRes
             representative
         })
         .collect()
+}
+
+fn measurement_count_for(
+    result: &ProfileResult,
+    results: &[ProfileResult],
+    counts: &BTreeMap<String, usize>,
+) -> usize {
+    counts
+        .get(&result.candidate.id)
+        .copied()
+        .or_else(|| {
+            let baseline_run_id = result
+                .realistic_validation
+                .as_ref()?
+                .baseline_run_id
+                .as_str();
+            let baseline = results.iter().find(|item| item.run_id == baseline_run_id)?;
+            counts.get(&baseline.candidate.id).copied()
+        })
+        .unwrap_or(1)
 }
 
 fn median_f64(mut values: Vec<f64>) -> Option<f64> {
@@ -1174,6 +1182,51 @@ mod tests {
             .find(|profile| profile.id == "interactive-fast")
             .unwrap();
         assert_eq!(fast.output_toks_per_s, Some(20.0));
+        assert_eq!(fast.measurement_count, 2);
+        assert_eq!(fast.confidence, "confirmed");
+    }
+
+    #[test]
+    fn realistic_recommendation_keeps_confirmation_evidence() {
+        let gguf = fake_metadata(Some("Q4_K_M"));
+        let baseline = fake_result("baseline", &gguf, 10.0, 100.0, Some(2048), Outcome::Pass);
+        let mut confirmation = fake_result(
+            "confirmation",
+            &gguf,
+            30.0,
+            300.0,
+            Some(2048),
+            Outcome::Pass,
+        );
+        confirmation.candidate.id = baseline.candidate.id.clone();
+        confirmation.test_kind = "confirmation".to_string();
+        let mut validated = fake_result("validated", &gguf, 20.0, 200.0, Some(2048), Outcome::Pass);
+        validated.candidate.id = format!("{}-realistic-validation", baseline.candidate.id);
+        validated.test_kind = "realistic-validation".to_string();
+        validated.validation_level = ValidationLevel::Realistic;
+        validated.realistic_validation = Some(RealisticValidation {
+            baseline_run_id: baseline.run_id.clone(),
+            target_prompt_tokens: 32_000,
+            requested_output_tokens: 1024,
+            actual_prompt_tokens: Some(32_000),
+            actual_output_tokens: Some(1024),
+            prompt_retained_ratio: Some(1.0),
+            generation_retained_ratio: Some(1.0),
+            incomplete_generation: false,
+        });
+
+        let recs = build_recommendations(
+            PathBuf::from("/models/test.gguf"),
+            &[baseline, confirmation, validated],
+            &SafetyLimits::default(),
+            Some(&fake_environment()),
+        );
+        let fast = recs
+            .profiles
+            .iter()
+            .find(|profile| profile.id == "interactive-fast")
+            .unwrap();
+        assert_eq!(fast.source_run_id, "validated");
         assert_eq!(fast.measurement_count, 2);
         assert_eq!(fast.confidence, "confirmed");
     }
