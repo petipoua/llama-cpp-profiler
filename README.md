@@ -23,23 +23,23 @@ selected:
 
 ```bash
 llama-cpp-profiler scan ~/Models
-llama-cpp-profiler inspect ~/Models/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive --json
+llama-cpp-profiler inspect ~/Models/<model-or-gguf> --json
 ```
 
 Run a bounded tuning pass and print the best observed configuration plus the
 exact next `serve` command:
 
 ```bash
-llama-cpp-profiler tune ~/Models/Qwopus3.6-35B-A3B-Coder-MTP --preset quick --max-runs 2
-llama-cpp-profiler serve ~/Models/Qwopus3.6-35B-A3B-Coder-MTP --profile interactive-fast --print
+llama-cpp-profiler tune ~/Models/<model-or-gguf> --preset quick --max-runs 2
+llama-cpp-profiler serve ~/Models/<model-or-gguf> --profile interactive-fast --print
 ```
 
 Or use the high-level command that tunes and prints the selected server command
 in one step:
 
 ```bash
-llama-cpp-profiler recommend ~/Models/Qwopus3.6-35B-A3B-Coder-MTP --preset quick
-llama-cpp-profiler recommend ~/Models/Qwopus3.6-35B-A3B-Coder-MTP --preset quick --agent
+llama-cpp-profiler recommend ~/Models/<model-or-gguf> --preset quick
+llama-cpp-profiler recommend ~/Models/<model-or-gguf> --preset quick --agent
 ```
 
 ## Usage
