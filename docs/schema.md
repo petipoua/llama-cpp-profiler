@@ -78,6 +78,8 @@ Important fields:
 - `environment`: current environment used when rebuilding recommendations.
 - `environment_valid`: whether the saved environment still matches the current
   environment during report/serve validation.
+- `coverage`: optional search scope for a tune run: preset, planned/tested
+  candidate counts, searched and omitted dimensions, and confirmation-run count.
 - `next_suggested_test`: a compact next action for future agents.
 
 Each profile contains:
@@ -112,14 +114,16 @@ Interactive `tune` output ends with a concise summary of the selected
 and prompt throughput, requested context, VRAM headroom, and a shell-escaped
 `llama-cpp-profiler serve ... --profile ... --print` command.
 
-`report --agent` prints one compact JSON object. Agent schema version `2` adds
-`realistic_validation` to each metric. `agent_schema_version` is the
+`report --agent` prints one compact JSON object. Agent schema version `3` adds
+search coverage and the expanded confidence labels. `agent_schema_version` is the
 stable contract version, separate from the profiler `schema_version`:
 
 - `best_profile_ids`: unambiguous `model-path#profile` keys for the best observed
   profiles.
 - `exact_command`
-- `confidence`: `low`, `medium`, or `high` for the top command
+- `confidence`: `provisional`, `benchmarked`, `confirmed`, or
+  `full-context-validated` for the top command
+- `coverage`: per-model candidate coverage, including dimensions not searched
 - `key_metrics`
 - `failures`
 - `stale_profiles`
@@ -144,6 +148,8 @@ profile:
 - `profile_id`
 - `profile_key`
 - `confidence`
+- `goal`: selected workload goal (`generation`, `prompt`, or `balanced`)
+- `measurement_count`, `coverage`
 - `command`
 - `exact_command`, `environment_valid`, `telemetry_status`, `risk`, `failures`, `stale`
 - `output_toks_per_s`, `prompt_toks_per_s`, `ttft_ms`

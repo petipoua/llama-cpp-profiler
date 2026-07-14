@@ -1,5 +1,7 @@
 use crate::gguf::{GgufMetadata, discover_models, format_bytes};
-use crate::profile::{AGENT_SCHEMA_VERSION, Recommendation, RecommendationFile, TelemetryStatus};
+use crate::profile::{
+    AGENT_SCHEMA_VERSION, Recommendation, RecommendationFile, SearchCoverage, TelemetryStatus,
+};
 use crate::runner::{collect_profiled_models, model_key_for_opencode, model_label_for_opencode};
 use anyhow::{Context, Result, bail};
 use comfy_table::{Cell, Table, presets::UTF8_FULL_CONDENSED};
@@ -32,10 +34,17 @@ struct AgentReport {
     best_profile_ids: Vec<String>,
     exact_command: Option<String>,
     confidence: Option<String>,
+    coverage: Vec<AgentCoverage>,
     key_metrics: Vec<AgentMetric>,
     failures: Vec<String>,
     stale_profiles: Vec<String>,
     next_suggested_test: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AgentCoverage {
+    model_path: PathBuf,
+    coverage: SearchCoverage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +71,7 @@ struct AgentMetric {
     headroom_mib: Option<u64>,
     risk: String,
     confidence: String,
+    measurement_count: usize,
     why: String,
     compatibility: crate::environment::Compatibility,
     exact_command: String,
@@ -161,6 +171,20 @@ pub fn print_report(root: &Path, options: ReportOptions) -> Result<()> {
                         "early EOS"
                     } else {
                         "complete"
+                    },
+                );
+            }
+            if let Some(coverage) = &recs.coverage {
+                println!(
+                    "{} search coverage: {}/{} planned candidates tested; searched {}; not searched {}",
+                    metadata.file_name,
+                    coverage.tested_candidates,
+                    coverage.planned_candidates,
+                    coverage.searched_dimensions.join(", "),
+                    if coverage.not_searched_dimensions.is_empty() {
+                        "none".to_string()
+                    } else {
+                        coverage.not_searched_dimensions.join(", ")
                     },
                 );
             }
@@ -360,6 +384,30 @@ pub fn markdown_for_recommendations(recommendations: &RecommendationFile) -> Str
             )
         }),
     ));
+    if let Some(coverage) = &recommendations.coverage {
+        lines.push(String::new());
+        lines.push("## Search coverage".to_string());
+        lines.push(String::new());
+        lines.push(format!(
+            "- `{}` preset: {}/{} planned candidates tested; confirmation runs: {}.",
+            format!("{:?}", coverage.preset).to_ascii_lowercase(),
+            coverage.tested_candidates,
+            coverage.planned_candidates,
+            coverage.confirmation_runs,
+        ));
+        lines.push(format!(
+            "- Searched: {}.",
+            coverage.searched_dimensions.join(", ")
+        ));
+        lines.push(format!(
+            "- Not searched: {}.",
+            if coverage.not_searched_dimensions.is_empty() {
+                "none".to_string()
+            } else {
+                coverage.not_searched_dimensions.join(", ")
+            }
+        ));
+    }
     if let Some(validation) = recommendations
         .profiles
         .iter()
@@ -413,12 +461,7 @@ pub fn markdown_for_recommendations(recommendations: &RecommendationFile) -> Str
 }
 
 pub fn tune_summary(recommendations: &RecommendationFile) -> String {
-    let Some(profile) = recommendations
-        .profiles
-        .iter()
-        .find(|profile| profile.id == "interactive-fast")
-        .or_else(|| recommendations.profiles.first())
-    else {
+    let Some(profile) = recommendations.profiles.first() else {
         return "## Tune summary\n\nNo usable best observed configuration was produced."
             .to_string();
     };
@@ -452,9 +495,16 @@ fn print_agent_report(profiled: &[(GgufMetadata, RecommendationFile)]) -> Result
     let mut failures = Vec::new();
     let mut stale_profiles = Vec::new();
     let mut next = None;
+    let mut coverage = Vec::new();
     for (metadata, recs) in profiled {
         if next.is_none() {
             next = recs.next_suggested_test.clone();
+        }
+        if let Some(model_coverage) = &recs.coverage {
+            coverage.push(AgentCoverage {
+                model_path: metadata.path.clone(),
+                coverage: model_coverage.clone(),
+            });
         }
         for rejected in &recs.rejected {
             failures.push(format!(
@@ -490,7 +540,7 @@ fn print_agent_report(profiled: &[(GgufMetadata, RecommendationFile)]) -> Result
         .map(|(_, profile)| profile.command_display.clone());
     let confidence = all_profiles
         .first()
-        .map(|(_, profile)| confidence_label(profile).to_string());
+        .map(|(_, profile)| profile.confidence.clone());
     let key_metrics = all_profiles
         .iter()
         .take(8)
@@ -516,7 +566,8 @@ fn print_agent_report(profiled: &[(GgufMetadata, RecommendationFile)]) -> Result
             ttft_ms: profile.ttft_ms,
             headroom_mib: profile.headroom_mib,
             risk: profile.risk.clone(),
-            confidence: confidence_label(profile).to_string(),
+            confidence: profile.confidence.clone(),
+            measurement_count: profile.measurement_count,
             why: agent_why(profile),
             compatibility: profile.compatibility,
             exact_command: profile.command_display.clone(),
@@ -528,6 +579,7 @@ fn print_agent_report(profiled: &[(GgufMetadata, RecommendationFile)]) -> Result
         best_profile_ids,
         exact_command,
         confidence,
+        coverage,
         key_metrics,
         failures: failures.into_iter().take(12).collect(),
         stale_profiles: stale_profiles.into_iter().take(12).collect(),
@@ -535,18 +587,6 @@ fn print_agent_report(profiled: &[(GgufMetadata, RecommendationFile)]) -> Result
     };
     println!("{}", serde_json::to_string(&report)?);
     Ok(())
-}
-
-fn confidence_label(profile: &Recommendation) -> &'static str {
-    match (profile.validation_level, profile.risk.as_str()) {
-        (
-            crate::profile::ValidationLevel::Fullctx | crate::profile::ValidationLevel::Realistic,
-            "low" | "medium",
-        ) => "high",
-        (crate::profile::ValidationLevel::StandardIngest, "low" | "medium") => "medium",
-        (crate::profile::ValidationLevel::Smoke, "low" | "medium") => "low",
-        _ => "low",
-    }
 }
 
 fn agent_why(profile: &Recommendation) -> String {
@@ -875,6 +915,8 @@ mod tests {
             peak_vram_mib: Some(1),
             headroom_mib: Some(1),
             risk: "low".to_string(),
+            confidence: "provisional".to_string(),
+            measurement_count: 1,
             note: String::new(),
             realistic_validation: None,
         };
@@ -888,6 +930,7 @@ mod tests {
             stale: Vec::new(),
             environment: None,
             environment_valid: false,
+            coverage: None,
             next_suggested_test: None,
         };
         let summary = tune_summary(&recommendations);

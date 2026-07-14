@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use llama_cpp_profiler::environment::capture_environment;
 use llama_cpp_profiler::gguf;
-use llama_cpp_profiler::profile::{Preset, SafetyLimits};
+use llama_cpp_profiler::profile::{Preset, SafetyLimits, WorkloadGoal};
 use llama_cpp_profiler::report::{self, ExportOptions, ReportOptions};
 use llama_cpp_profiler::runner::{
     self, FullCtxOptions, ProbeMode, RecommendOptions, ServeOptions, TuneOptions,
@@ -87,6 +87,12 @@ struct TuneArgs {
     /// Validate the selected observed candidate with a long prompt and up to 1024 output tokens.
     #[arg(long)]
     validate_best: bool,
+    /// Rerun promising candidates and rank their measurements by median.
+    #[arg(long)]
+    confirm_best: bool,
+    /// Optimize the primary recommendation for generation, prompt ingest, or a balanced workload.
+    #[arg(long, value_enum, default_value_t = WorkloadGoal::Balanced)]
+    goal: WorkloadGoal,
     /// Print the candidate plan as JSON and do not start llama-server.
     #[arg(long)]
     plan: bool,
@@ -106,8 +112,12 @@ struct RecommendArgs {
     probe_mode: ProbeMode,
     #[arg(long)]
     max_runs: Option<usize>,
-    #[arg(long, default_value = "interactive-fast")]
-    profile: String,
+    /// Use a saved profile explicitly instead of the profile selected by --goal.
+    #[arg(long)]
+    profile: Option<String>,
+    /// Optimize the primary recommendation for generation, prompt ingest, or a balanced workload.
+    #[arg(long, value_enum, default_value_t = WorkloadGoal::Balanced)]
+    goal: WorkloadGoal,
     #[arg(long, default_value_t = 18_080)]
     port: u16,
     #[arg(long, default_value_t = 512)]
@@ -130,6 +140,9 @@ struct RecommendArgs {
     /// Validate the selected observed candidate with a long prompt and up to 1024 output tokens.
     #[arg(long)]
     validate_best: bool,
+    /// Rerun promising candidates and rank their measurements by median.
+    #[arg(long)]
+    confirm_best: bool,
     /// Emit compact JSON for agents instead of human text.
     #[arg(long)]
     agent: bool,
@@ -283,6 +296,8 @@ async fn main() -> Result<()> {
                     near_full_ingest: args.near_full_ingest,
                     near_full_target_tokens: args.near_full_target_tokens,
                     validate_best: args.validate_best,
+                    confirm_best: args.confirm_best,
+                    goal: args.goal,
                     probe_mode: args.probe_mode,
                 },
             )
@@ -300,6 +315,7 @@ async fn main() -> Result<()> {
                     preset: args.preset,
                     max_runs: args.max_runs,
                     profile: args.profile,
+                    goal: args.goal,
                     port: args.port,
                     safety: SafetyLimits {
                         min_vram_free_mib: args.min_vram_free_mib,
@@ -311,6 +327,7 @@ async fn main() -> Result<()> {
                     near_full_ingest: args.near_full_ingest,
                     near_full_target_tokens: args.near_full_target_tokens,
                     validate_best: args.validate_best,
+                    confirm_best: args.confirm_best,
                     agent: args.agent,
                     probe_mode: args.probe_mode,
                 },

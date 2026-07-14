@@ -2,14 +2,15 @@ use crate::environment::{Compatibility, EnvironmentSnapshot, compare_environment
 use crate::gguf::{GgufMetadata, ModelIdentity, ModelKind, read_metadata};
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::str::FromStr;
 
-pub const SCHEMA_VERSION: u32 = 5;
-pub const AGENT_SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 6;
+pub const AGENT_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -45,6 +46,25 @@ impl FromStr for Preset {
             "standard" => Ok(Self::Standard),
             "thorough" => Ok(Self::Thorough),
             other => bail!("unknown preset {other:?}; expected quick, standard, or thorough"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkloadGoal {
+    Generation,
+    Prompt,
+    #[default]
+    Balanced,
+}
+
+impl WorkloadGoal {
+    pub fn profile_id(self) -> &'static str {
+        match self {
+            Self::Generation => "interactive-fast",
+            Self::Prompt => "prompt-replay",
+            Self::Balanced => "balanced",
         }
     }
 }
@@ -240,7 +260,19 @@ pub struct RecommendationFile {
     pub environment: Option<EnvironmentSnapshot>,
     #[serde(default)]
     pub environment_valid: bool,
+    #[serde(default)]
+    pub coverage: Option<SearchCoverage>,
     pub next_suggested_test: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SearchCoverage {
+    pub preset: Preset,
+    pub planned_candidates: usize,
+    pub tested_candidates: usize,
+    pub searched_dimensions: Vec<String>,
+    pub not_searched_dimensions: Vec<String>,
+    pub confirmation_runs: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -276,9 +308,21 @@ pub struct Recommendation {
     pub peak_vram_mib: Option<u64>,
     pub headroom_mib: Option<u64>,
     pub risk: String,
+    #[serde(default = "default_confidence")]
+    pub confidence: String,
+    #[serde(default = "default_measurement_count")]
+    pub measurement_count: usize,
     pub note: String,
     #[serde(default)]
     pub realistic_validation: Option<RealisticValidation>,
+}
+
+fn default_confidence() -> String {
+    "provisional".to_string()
+}
+
+const fn default_measurement_count() -> usize {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -396,12 +440,20 @@ pub fn build_recommendations_for_model(
         realistic
     };
 
+    let measurement_counts = confirmation_measurement_counts(&usable);
+    let usable = median_confirmed_measurements(usable);
+    let usable = usable.iter().collect::<Vec<_>>();
+
     if let Some(result) = best_by(&usable, generation_score) {
         profiles.push(to_recommendation(
             "interactive-fast",
             "Best observed configuration for generation throughput within safety limits",
             result,
             safety,
+            measurement_counts
+                .get(&result.candidate.id)
+                .copied()
+                .unwrap_or(1),
         ));
     }
 
@@ -416,6 +468,10 @@ pub fn build_recommendations_for_model(
             "Best observed configuration for generation throughput with at least 1 GiB free VRAM",
             result,
             safety,
+            measurement_counts
+                .get(&result.candidate.id)
+                .copied()
+                .unwrap_or(1),
         ));
     }
 
@@ -425,6 +481,10 @@ pub fn build_recommendations_for_model(
             "Best observed configuration for prompt ingest throughput within safety limits",
             result,
             safety,
+            measurement_counts
+                .get(&result.candidate.id)
+                .copied()
+                .unwrap_or(1),
         ));
     }
 
@@ -434,6 +494,10 @@ pub fn build_recommendations_for_model(
             "Best observed configuration for balanced prompt and output throughput",
             result,
             safety,
+            measurement_counts
+                .get(&result.candidate.id)
+                .copied()
+                .unwrap_or(1),
         ));
     }
 
@@ -507,7 +571,90 @@ pub fn build_recommendations_for_model(
         stale,
         environment: current_environment.cloned(),
         environment_valid: current_environment.is_some(),
+        coverage: None,
         next_suggested_test,
+    }
+}
+
+fn confirmation_measurement_counts(results: &[&ProfileResult]) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for result in results
+        .iter()
+        .copied()
+        .filter(|result| matches!(result.test_kind.as_str(), "tune" | "confirmation"))
+    {
+        *counts.entry(result.candidate.id.clone()).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn median_confirmed_measurements(results: Vec<&ProfileResult>) -> Vec<ProfileResult> {
+    let mut groups = BTreeMap::<String, Vec<&ProfileResult>>::new();
+    for result in results {
+        groups
+            .entry(result.candidate.id.clone())
+            .or_default()
+            .push(result);
+    }
+    groups
+        .into_values()
+        .map(|group| {
+            let mut representative = (*group[0]).clone();
+            let confirmations = group
+                .iter()
+                .filter(|result| result.test_kind == "confirmation")
+                .count();
+            if confirmations > 0 && group.len() > 1 {
+                representative.metrics.server_generation_toks_per_s = median_f64(
+                    group
+                        .iter()
+                        .filter_map(|result| result.metrics.server_generation_toks_per_s)
+                        .collect(),
+                );
+                representative.metrics.server_prompt_eval_toks_per_s = median_f64(
+                    group
+                        .iter()
+                        .filter_map(|result| result.metrics.server_prompt_eval_toks_per_s)
+                        .collect(),
+                );
+                representative.metrics.client_ttft_ms = median_u64(
+                    group
+                        .iter()
+                        .filter_map(|result| result.metrics.client_ttft_ms)
+                        .collect(),
+                );
+                representative.metrics.min_free_vram_mib = median_u64(
+                    group
+                        .iter()
+                        .filter_map(|result| result.metrics.min_free_vram_mib)
+                        .collect(),
+                );
+                representative.note = format!(
+                    "{}; ranked by median of {} measurements",
+                    representative.note,
+                    group.len()
+                );
+            }
+            representative
+        })
+        .collect()
+}
+
+fn median_f64(mut values: Vec<f64>) -> Option<f64> {
+    values.sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
+    match values.len() {
+        0 => None,
+        len if len % 2 == 1 => values.get(len / 2).copied(),
+        len => Some((values[len / 2 - 1] + values[len / 2]) / 2.0),
+    }
+}
+
+fn median_u64(mut values: Vec<u64>) -> Option<u64> {
+    values.sort_unstable();
+    match values.len() {
+        0 => None,
+        len if len % 2 == 1 => values.get(len / 2).copied(),
+        len => Some((values[len / 2 - 1] + values[len / 2]) / 2),
     }
 }
 
@@ -848,6 +995,7 @@ fn to_recommendation(
     role: &str,
     result: &ProfileResult,
     safety: &SafetyLimits,
+    measurement_count: usize,
 ) -> Recommendation {
     Recommendation {
         id: id.to_string(),
@@ -871,8 +1019,25 @@ fn to_recommendation(
         peak_vram_mib: result.metrics.peak_vram_mib,
         headroom_mib: result.metrics.min_free_vram_mib,
         risk: risk_label(result, safety),
+        confidence: confidence_for(result, measurement_count),
+        measurement_count,
         note: result.note.clone(),
         realistic_validation: result.realistic_validation.clone(),
+    }
+}
+
+fn confidence_for(result: &ProfileResult, measurement_count: usize) -> String {
+    if result.validation_level == ValidationLevel::Fullctx {
+        "full-context-validated".to_string()
+    } else if measurement_count >= 2 {
+        "confirmed".to_string()
+    } else if matches!(
+        result.validation_level,
+        ValidationLevel::StandardIngest | ValidationLevel::Realistic
+    ) {
+        "benchmarked".to_string()
+    } else {
+        "provisional".to_string()
     }
 }
 
@@ -981,6 +1146,36 @@ mod tests {
         assert_eq!(fast.source_run_id, "slow-safe");
         assert!(recs.rejected.iter().any(|run| run.run_id == "fast-tight"));
         assert!(recs.rejected.iter().any(|run| run.run_id == "oom"));
+    }
+
+    #[test]
+    fn confirmed_candidates_are_ranked_by_median_measurement() {
+        let gguf = fake_metadata(Some("Q4_K_M"));
+        let baseline = fake_result("baseline", &gguf, 10.0, 100.0, Some(2048), Outcome::Pass);
+        let mut confirmation = fake_result(
+            "confirmation",
+            &gguf,
+            30.0,
+            300.0,
+            Some(2048),
+            Outcome::Pass,
+        );
+        confirmation.candidate.id = baseline.candidate.id.clone();
+        confirmation.test_kind = "confirmation".to_string();
+        let recs = build_recommendations(
+            PathBuf::from("/models/test.gguf"),
+            &[baseline, confirmation],
+            &SafetyLimits::default(),
+            Some(&fake_environment()),
+        );
+        let fast = recs
+            .profiles
+            .iter()
+            .find(|profile| profile.id == "interactive-fast")
+            .unwrap();
+        assert_eq!(fast.output_toks_per_s, Some(20.0));
+        assert_eq!(fast.measurement_count, 2);
+        assert_eq!(fast.confidence, "confirmed");
     }
 
     #[test]

@@ -40,6 +40,7 @@ in one step:
 ```bash
 llama-cpp-profiler recommend ~/Models/<model-or-gguf> --preset quick
 llama-cpp-profiler recommend ~/Models/<model-or-gguf> --preset quick --agent
+llama-cpp-profiler recommend ~/Models/<model-or-gguf> --preset quick --goal generation --agent
 ```
 
 ## Usage
@@ -69,6 +70,13 @@ Tune safely:
 llama-cpp-profiler tune ~/Models/<model-or-gguf> --preset standard
 ```
 
+Choose what the primary recommendation optimizes for. `generation` favors output
+throughput, `prompt` favors prompt ingest, and `balanced` is the default:
+
+```bash
+llama-cpp-profiler recommend ~/Models/<model-or-gguf> --preset quick --goal prompt
+```
+
 `tune` starts one `llama-server` at a time on localhost ports beginning at `18180`,
 runs sanity/output/ingest probes, writes raw artifacts, and stops the server after
 each candidate. It can promote safer or more aggressive already-planned
@@ -81,6 +89,10 @@ best observed candidate
 with one realistic combined request: roughly 25% of context (bounded to 16k–64k
 input tokens, with output space reserved) and up to 1024 output tokens. This
 final validation is outside the primary-search and thread-refinement budgets.
+
+Use `--confirm-best` when repeatability matters. It reruns up to three promising
+candidates and ranks confirmed candidates by median throughput, reducing noise
+from clock changes, cache warming, and background desktop activity.
 
 The default `thinking` probe mode keeps the reasoning-oriented baseline:
 generated server commands and chat probes use `--reasoning on`,
@@ -158,10 +170,10 @@ llama-cpp-profiler report ~/Models --include-stale
 ```
 
 The human report prints comparison tables, native versus validated context,
-rejected runs, telemetry safety status, and the next suggested test. `--agent`
+rejected runs, telemetry safety status, candidate coverage, and the next suggested test. `--agent`
 emits stable JSON with an explicit agent schema version, model identity, environment
-validity, telemetry status, exact command, metrics, failures, stale runs, and next
-action.
+validity, telemetry status, selected goal, exact command, metrics, validation,
+risk, confidence, coverage, failures, stale runs, and next action.
 
 Export managed notes or client labels:
 
@@ -185,8 +197,8 @@ generated Markdown block.
 ```bash
 llama-cpp-profiler scan PATH [--no-tui]
 llama-cpp-profiler inspect PATH [--json]
-llama-cpp-profiler tune PATH [--ctx TOKENS] [--preset quick|standard|thorough] [--probe-mode thinking|generic] [--max-runs N] [--min-vram-free-mib MIB] [--max-swap-delta-mib MIB] [--port-start PORT] [--gpu-index INDEX] [--n-cpu-moe-values VALUES] [--near-full-ingest] [--near-full-target-tokens TOKENS] [--validate-best] [--plan] [--json]
-llama-cpp-profiler recommend PATH [--ctx TOKENS] [--preset quick|standard|thorough] [--probe-mode thinking|generic] [--max-runs N] [--profile ID] [--port PORT] [--min-vram-free-mib MIB] [--max-swap-delta-mib MIB] [--port-start PORT] [--gpu-index INDEX] [--n-cpu-moe-values VALUES] [--near-full-ingest] [--near-full-target-tokens TOKENS] [--validate-best] [--agent]
+llama-cpp-profiler tune PATH [--ctx TOKENS] [--preset quick|standard|thorough] [--goal generation|prompt|balanced] [--probe-mode thinking|generic] [--max-runs N] [--min-vram-free-mib MIB] [--max-swap-delta-mib MIB] [--port-start PORT] [--gpu-index INDEX] [--n-cpu-moe-values VALUES] [--near-full-ingest] [--near-full-target-tokens TOKENS] [--validate-best] [--confirm-best] [--plan] [--json]
+llama-cpp-profiler recommend PATH [--ctx TOKENS] [--preset quick|standard|thorough] [--goal generation|prompt|balanced] [--probe-mode thinking|generic] [--max-runs N] [--profile ID] [--port PORT] [--min-vram-free-mib MIB] [--max-swap-delta-mib MIB] [--port-start PORT] [--gpu-index INDEX] [--n-cpu-moe-values VALUES] [--near-full-ingest] [--near-full-target-tokens TOKENS] [--validate-best] [--confirm-best] [--agent]
 llama-cpp-profiler fullctx PATH [--profile ID] [--target-tokens TOKENS] [--ctx TOKENS] [--probe-mode thinking|generic] [--min-vram-free-mib MIB] [--max-swap-delta-mib MIB] [--port-start PORT] [--gpu-index INDEX]
 llama-cpp-profiler report PATH [--agent] [--include-stale]
 llama-cpp-profiler serve PATH [--profile ID] [--port PORT] [--print] [--allow-stale]
@@ -214,6 +226,9 @@ llama-cpp-profiler export PATH [--markdown] [--opencode PATH] [--dry-run] [--wri
   back in balanced-score order; a failed validation disqualifies its short-probe
   baseline from recommendations.
 - Plain `tune` and `recommend` default to `quick`; `standard` and `thorough` are explicit deeper modes.
+- `--goal balanced` is the default. It places the matching `balanced`, `interactive-fast`, or `prompt-replay` profile first in tune output; `recommend` uses that primary profile unless `--profile` is explicit.
+- `--confirm-best` reruns up to three safe, promising candidates and uses median measurements for confirmed ranking.
+- Confidence is `provisional` for smoke evidence, `benchmarked` after standard/realistic validation, `confirmed` after repeated measurements, and `full-context-validated` after `fullctx`.
 - `thinking` is the default probe mode; `generic` omits reasoning-specific arguments and request fields.
 - `quick` runs are labeled `smoke`; normal `standard` and `thorough` probes are
   labeled `standard-ingest`; final-stage runs are labeled `realistic`; `fullctx`

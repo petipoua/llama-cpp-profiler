@@ -3,8 +3,9 @@ use crate::gguf::{GgufMetadata, ModelIdentity, read_metadata, resolve_model_path
 use crate::profile::{
     ArtifactPaths, CandidateConfig, Manifest, Outcome, Preset, ProbeSummary, ProfileResult,
     RealisticValidation, Recommendation, RecommendationFile, SCHEMA_VERSION, SafetyLimits,
-    TelemetryStatus, ValidationLevel, build_recommendations_for_model, command_display,
-    generate_candidates, generate_candidates_for_environment,
+    SearchCoverage, TelemetryStatus, ValidationLevel, WorkloadGoal,
+    build_recommendations_for_model, command_display, generate_candidates,
+    generate_candidates_for_environment,
 };
 use crate::report;
 use crate::telemetry::{TelemetrySampler, TelemetrySummary};
@@ -48,6 +49,8 @@ pub struct TuneOptions {
     pub near_full_ingest: bool,
     pub near_full_target_tokens: Option<u64>,
     pub validate_best: bool,
+    pub confirm_best: bool,
+    pub goal: WorkloadGoal,
     pub probe_mode: ProbeMode,
 }
 
@@ -75,7 +78,8 @@ pub struct RecommendOptions {
     pub ctx_cap: Option<u64>,
     pub preset: Preset,
     pub max_runs: Option<usize>,
-    pub profile: String,
+    pub profile: Option<String>,
+    pub goal: WorkloadGoal,
     pub port: u16,
     pub safety: SafetyLimits,
     pub port_start: u16,
@@ -84,6 +88,7 @@ pub struct RecommendOptions {
     pub near_full_ingest: bool,
     pub near_full_target_tokens: Option<u64>,
     pub validate_best: bool,
+    pub confirm_best: bool,
     pub agent: bool,
     pub probe_mode: ProbeMode,
 }
@@ -98,7 +103,10 @@ pub struct RecommendOutput {
     pub telemetry_status: TelemetryStatus,
     pub profile_id: String,
     pub profile_key: String,
+    pub goal: WorkloadGoal,
     pub confidence: String,
+    pub measurement_count: usize,
+    pub coverage: Option<SearchCoverage>,
     pub command: String,
     pub exact_command: String,
     pub output_toks_per_s: Option<f64>,
@@ -256,6 +264,7 @@ async fn run_tune_with_telemetry(
             stale: Vec::new(),
             environment: None,
             environment_valid: false,
+            coverage: None,
             next_suggested_test: None,
         });
     }
@@ -336,6 +345,21 @@ async fn run_tune_with_telemetry(
     )
     .await?;
 
+    let confirmation_runs = if options.confirm_best {
+        run_confirmation_runs(
+            &metadata,
+            &capabilities,
+            &options,
+            &environment,
+            &current_results,
+            completed.saturating_add(5),
+            &telemetry_source,
+        )
+        .await?
+    } else {
+        0
+    };
+
     if options.preset != Preset::Quick || options.validate_best {
         let mut validation_candidates = current_results
             .iter()
@@ -344,8 +368,8 @@ async fn run_tune_with_telemetry(
             })
             .cloned()
             .collect::<Vec<_>>();
-        if let Some(refined) = refined_winner {
-            validation_candidates.push(refined);
+        if let Some(refined) = refined_winner.as_ref() {
+            validation_candidates.push(refined.clone());
         }
         run_realistic_validation(
             &metadata,
@@ -362,19 +386,173 @@ async fn run_tune_with_telemetry(
     write_manifest(&metadata)?;
     let all_results = load_prior_results(&metadata.profiler_dir())?;
     let model_identity = metadata.model_identity();
-    let recommendations = build_recommendations_for_model(
+    let mut recommendations = build_recommendations_for_model(
         metadata.path.clone(),
         Some(&model_identity),
         &all_results,
         &options.safety,
         Some(&environment),
     );
+    recommendations.coverage = Some(search_coverage(
+        options.preset,
+        run_budget,
+        completed,
+        &all_candidates,
+        options.near_full_ingest,
+        refined_winner.is_some(),
+        confirmation_runs,
+    ));
+    apply_confidence_labels(&mut recommendations);
+    prioritize_goal(&mut recommendations, options.goal);
     write_json(
         metadata.profiler_dir().join("recommendations.json"),
         &recommendations,
     )?;
     report::write_latest_markdown(&metadata.profiler_dir(), &recommendations)?;
     Ok(recommendations)
+}
+
+async fn run_confirmation_runs(
+    metadata: &GgufMetadata,
+    capabilities: &ServerCapabilities,
+    options: &TuneOptions,
+    environment: &EnvironmentSnapshot,
+    primary_results: &[ProfileResult],
+    port_offset: usize,
+    telemetry_source: &TelemetrySource,
+) -> Result<usize> {
+    let mut promising = primary_results
+        .iter()
+        .filter(|result| {
+            result.outcome.is_usable() && !violates_safety(&result.metrics, &options.safety)
+        })
+        .collect::<Vec<_>>();
+    promising.sort_by(|left, right| {
+        balanced_throughput(right)
+            .partial_cmp(&balanced_throughput(left))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    promising.truncate(3);
+    if promising.is_empty() {
+        eprintln!("confirmation skipped: no safe candidate was observed");
+        return Ok(0);
+    }
+    eprintln!(
+        "confirmation: rerunning {} promising candidates",
+        promising.len()
+    );
+    let confirmation_count = promising.len();
+    for (index, baseline) in promising.into_iter().enumerate() {
+        let offset =
+            u16::try_from(port_offset.saturating_add(index)).context("confirmation port offset")?;
+        let port = find_open_port(options.port_start.saturating_add(offset))?;
+        let result = run_candidate(
+            metadata,
+            capabilities,
+            RunRequest {
+                test_kind: "confirmation".to_string(),
+                candidate: baseline.candidate.clone(),
+                port,
+                prompt_plan: PromptPlan::Tune {
+                    ingest_target_tokens: options.preset.ingest_target_tokens(),
+                    near_full_ingest_tokens: None,
+                },
+                probe_mode: options.probe_mode,
+                telemetry_source: telemetry_source.clone(),
+            },
+            &options.safety,
+            options.gpu_index,
+            environment.clone(),
+            if options.preset == Preset::Quick {
+                ValidationLevel::Smoke
+            } else {
+                ValidationLevel::StandardIngest
+            },
+        )
+        .await?;
+        eprintln!(
+            "  confirmed {}: {:?}, output {:?} tok/s, prompt {:?} tok/s",
+            baseline.candidate.id,
+            result.outcome,
+            result.metrics.server_generation_toks_per_s,
+            result.metrics.server_prompt_eval_toks_per_s,
+        );
+    }
+    Ok(confirmation_count)
+}
+
+fn search_coverage(
+    preset: Preset,
+    planned_candidates: usize,
+    tested_candidates: usize,
+    candidates: &[CandidateConfig],
+    near_full_ingest: bool,
+    thread_refined: bool,
+    confirmation_runs: usize,
+) -> SearchCoverage {
+    let mut searched_dimensions = vec!["context", "batch", "microbatch", "KV cache"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if candidates.iter().any(|candidate| {
+        candidate.cpu_moe || candidate.n_cpu_moe.is_some() || candidate.gpu_layers.is_some()
+    }) {
+        searched_dimensions.push("model placement".to_string());
+    }
+    if thread_refined {
+        searched_dimensions.push("CPU threads".to_string());
+    }
+    let mut not_searched_dimensions = Vec::new();
+    if !near_full_ingest {
+        not_searched_dimensions.push("near-full context".to_string());
+    }
+    if !thread_refined {
+        not_searched_dimensions.push("CPU threads".to_string());
+    }
+    if confirmation_runs == 0 {
+        not_searched_dimensions.push("repeated measurements".to_string());
+    }
+    SearchCoverage {
+        preset,
+        planned_candidates,
+        tested_candidates,
+        searched_dimensions,
+        not_searched_dimensions,
+        confirmation_runs,
+    }
+}
+
+fn prioritize_goal(recommendations: &mut RecommendationFile, goal: WorkloadGoal) {
+    let profile_id = goal.profile_id();
+    if let Some(index) = recommendations
+        .profiles
+        .iter()
+        .position(|profile| profile.id == profile_id)
+    {
+        recommendations.profiles.swap(0, index);
+    }
+}
+
+fn apply_confidence_labels(recommendations: &mut RecommendationFile) {
+    let broad_search = recommendations.coverage.as_ref().is_some_and(|coverage| {
+        coverage.tested_candidates >= 3 || coverage.tested_candidates >= coverage.planned_candidates
+    });
+    for profile in &mut recommendations.profiles {
+        profile.confidence = if profile.validation_level == ValidationLevel::Fullctx {
+            "full-context-validated".to_string()
+        } else if profile.measurement_count >= 2 {
+            "confirmed".to_string()
+        } else if broad_search
+            && matches!(
+                profile.validation_level,
+                ValidationLevel::StandardIngest | ValidationLevel::Realistic
+            )
+        {
+            "benchmarked".to_string()
+        } else {
+            "provisional".to_string()
+        };
+    }
 }
 
 async fn run_thread_refinement(
@@ -830,6 +1008,8 @@ pub async fn run_recommend(path: &Path, options: RecommendOptions) -> Result<Rec
             near_full_ingest: options.near_full_ingest,
             near_full_target_tokens: options.near_full_target_tokens,
             validate_best: options.validate_best,
+            confirm_best: options.confirm_best,
+            goal: options.goal,
             probe_mode: options.probe_mode,
         },
     )
@@ -838,7 +1018,13 @@ pub async fn run_recommend(path: &Path, options: RecommendOptions) -> Result<Rec
     let profile = recs
         .profiles
         .iter()
-        .find(|profile| profile.id == options.profile)
+        .find(|profile| {
+            options
+                .profile
+                .as_deref()
+                .unwrap_or(options.goal.profile_id())
+                == profile.id
+        })
         .or_else(|| recs.profiles.first())
         .with_context(|| {
             format!(
@@ -876,6 +1062,8 @@ pub async fn run_recommend(path: &Path, options: RecommendOptions) -> Result<Rec
             stale: recs.stale.clone(),
         },
         recs.next_suggested_test.clone(),
+        options.goal,
+        recs.coverage.clone(),
     ))
 }
 
@@ -1154,6 +1342,8 @@ fn recommend_output(
     command: String,
     validation: RecommendValidation,
     next_suggested_test: Option<String>,
+    goal: WorkloadGoal,
+    coverage: Option<SearchCoverage>,
 ) -> RecommendOutput {
     RecommendOutput {
         agent_schema_version: crate::profile::AGENT_SCHEMA_VERSION,
@@ -1164,7 +1354,10 @@ fn recommend_output(
         telemetry_status: profile.telemetry_status,
         profile_id: profile.id.clone(),
         profile_key: profile_key(model_path, profile),
-        confidence: confidence_label(profile).to_string(),
+        goal,
+        confidence: profile.confidence.clone(),
+        measurement_count: profile.measurement_count,
+        coverage,
         exact_command: command.clone(),
         command,
         output_toks_per_s: profile.output_toks_per_s,
@@ -1183,15 +1376,6 @@ fn recommend_output(
 
 pub fn profile_key(model_path: &Path, profile: &Recommendation) -> String {
     format!("{}#{}", model_path.display(), profile.id)
-}
-
-fn confidence_label(profile: &Recommendation) -> &'static str {
-    match (profile.validation_level, profile.risk.as_str()) {
-        (ValidationLevel::Fullctx | ValidationLevel::Realistic, "low" | "medium") => "high",
-        (ValidationLevel::StandardIngest, "low" | "medium") => "medium",
-        (ValidationLevel::Smoke, "low" | "medium") => "low",
-        _ => "low",
-    }
 }
 
 pub fn current_environment_best_effort() -> EnvironmentSnapshot {
@@ -2936,6 +3120,8 @@ llama_perf_context_print:        prompt eval time =   1000.00 ms / 16000 tokens 
                 near_full_ingest: false,
                 near_full_target_tokens: None,
                 validate_best: true,
+                confirm_best: false,
+                goal: WorkloadGoal::Balanced,
                 probe_mode: ProbeMode::Thinking,
             },
             TelemetrySource::Fixed(TelemetrySummary {
