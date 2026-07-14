@@ -1,10 +1,12 @@
 # Data Schemas
 
 The schemas are versioned by `schema_version`; the current beta schema version is
-`6`. Version `5` added realistic-validation metadata and outcomes. Version `4`
-added optional candidate thread counts and thread-refinement run kinds. Version
-`3` added versioned model identity and validation fields. Earlier files are read
-best-effort; files without model identity are retained as legacy stale evidence.
+`6`. Version `6` added workload goals, search coverage, recommendation confidence,
+and repeated-measurement counts. Version `5` added realistic-validation metadata
+and outcomes. Version `4` added optional candidate thread counts and
+thread-refinement run kinds. Version `3` added versioned model identity and
+validation fields. Earlier files are read best-effort; files without model
+identity are retained as legacy stale evidence.
 
 ## `result.json`
 
@@ -122,18 +124,19 @@ and prompt throughput, requested context, VRAM headroom, and a shell-escaped
 search coverage and the expanded confidence labels. `agent_schema_version` is the
 stable contract version, separate from the profiler `schema_version`:
 
-- `best_profile_ids`: unambiguous `model-path#profile` keys for the best observed
-  profiles.
+- `best_profile_ids`: up to five unambiguous `model-path#profile` keys for the
+  best observed profiles.
 - `exact_command`
 - `confidence`: `provisional`, `benchmarked`, `confirmed`, or
   `full-context-validated` for the top command
 - `coverage`: per-model candidate coverage, including dimensions not searched
-- `key_metrics`
+- `key_metrics`: up to eight profile metric objects
 - `failures`
 - `stale_profiles`
 - `next_suggested_test`
 - each metric also includes model identity, environment validity, telemetry
-  status, risk, validation level, metrics, failures, and exact command.
+  status, risk, validation level, measurements, and exact command. Failures are
+  reported once in the top-level `failures` array.
 
 Each metric includes model path, `profile_key`, profile id, source run id, source
 candidate id, model kind, quant, native context, test kind, requested context,

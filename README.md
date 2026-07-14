@@ -221,7 +221,8 @@ llama-cpp-profiler export PATH [--markdown] [--opencode PATH] [--dry-run] [--wri
 - Candidate plans try that native/explicit context first. Lower-context fallbacks
   are available for adaptive promotion after failed or too-tight runs.
 - Safety defaults are `--min-vram-free-mib 512` and `--max-swap-delta-mib 1024`.
-- `quick` runs at most 6 candidates; `standard` runs at most 16; `thorough` runs a broader sweep.
+- `quick` runs at most 6 candidates; `standard` runs at most 16; `thorough`
+  runs at most 48.
 - These limits apply to the primary placement search. A CPU-participating
   selected candidate can add up to five thread-refinement runs: llama.cpp
   defaults, half/all physical cores, physical/logical splits, and all logical
