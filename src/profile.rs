@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::str::FromStr;
 
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 pub const AGENT_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -78,7 +78,7 @@ pub struct SafetyLimits {
 impl Default for SafetyLimits {
     fn default() -> Self {
         Self {
-            min_vram_free_mib: 512,
+            min_vram_free_mib: 800,
             max_swap_delta_mib: 1024,
         }
     }
@@ -91,6 +91,10 @@ pub struct CandidateConfig {
     pub batch: Option<u64>,
     pub ubatch: Option<u64>,
     pub kv_cache: Option<String>,
+    /// Value-cache quantization when it differs from `kv_cache`. Legacy results
+    /// omit this field and therefore use `kv_cache` for both K and V.
+    #[serde(default)]
+    pub kv_cache_v: Option<String>,
     pub fit_target: Option<u64>,
     pub gpu_layers: Option<u64>,
     pub cpu_moe: bool,
@@ -457,12 +461,12 @@ pub fn build_recommendations_for_model(
     let safe: Vec<&ProfileResult> = usable
         .iter()
         .copied()
-        .filter(|result| result.metrics.min_free_vram_mib.unwrap_or(0) >= 1024)
+        .filter(|result| result.metrics.min_free_vram_mib.unwrap_or(0) >= safety.min_vram_free_mib)
         .collect();
     if let Some(result) = best_by(&safe, generation_score) {
         profiles.push(to_recommendation(
             "interactive-safe",
-            "Best observed configuration for generation throughput with at least 1 GiB free VRAM",
+            "Highest-precision configuration within the configured VRAM safety floor, ranked by generation throughput within that precision",
             result,
             safety,
             measurement_count_for(result, results, &measurement_counts),
@@ -677,22 +681,24 @@ pub fn command_display(command: &[String]) -> String {
 fn dense_candidates(requested_context: u64) -> Vec<CandidateConfig> {
     let mut candidates = Vec::new();
     let priority = [
-        ("q8_0", 1024, 256, 1536),
-        ("q8_0", 4096, 1024, 1536),
-        ("q8_0", 8192, 2048, 1536),
-        ("q8_0", 16384, 4096, 1536),
-        ("q4_0", 8192, 2048, 768),
-        ("q4_0", 16384, 4096, 512),
-        ("q4_0", 16384, 4096, 256),
-        ("q4_0", 32768, 4096, 512),
+        ("q8_0", "q8_0", 1024, 256, 1536),
+        ("q8_0", "q4_0", 1024, 256, 1536),
+        ("q4_0", "q4_0", 1024, 256, 1536),
+        ("q8_0", "q8_0", 8192, 2048, 1536),
+        ("q8_0", "q4_0", 8192, 2048, 1536),
+        ("q4_0", "q4_0", 8192, 2048, 768),
+        ("q8_0", "q8_0", 16384, 4096, 1536),
+        ("q8_0", "q4_0", 16384, 4096, 1536),
+        ("q4_0", "q4_0", 16384, 4096, 512),
     ];
-    for (kv_cache, batch, ubatch, fit_target) in priority {
+    for (kv_cache, kv_cache_v, batch, ubatch, fit_target) in priority {
         candidates.push(CandidateConfig {
-            id: format!("dense-{kv_cache}-fit{fit_target}-b{batch}-ub{ubatch}"),
+            id: cache_candidate_id("dense", kv_cache, kv_cache_v, fit_target, batch, ubatch),
             requested_context,
             batch: Some(batch),
             ubatch: Some(ubatch),
             kv_cache: Some(kv_cache.to_string()),
+            kv_cache_v: (kv_cache_v != kv_cache).then(|| kv_cache_v.to_string()),
             fit_target: Some(fit_target),
             gpu_layers: None,
             cpu_moe: false,
@@ -705,7 +711,7 @@ fn dense_candidates(requested_context: u64) -> Vec<CandidateConfig> {
         });
     }
 
-    let kv_types = ["q8_0", "q4_0"];
+    let kv_types = [("q8_0", "q8_0"), ("q8_0", "q4_0"), ("q4_0", "q4_0")];
     let batches = [
         (1024, 256),
         (2048, 512),
@@ -715,10 +721,11 @@ fn dense_candidates(requested_context: u64) -> Vec<CandidateConfig> {
     ];
     let fit_targets = [1536, 768, 512, 256];
 
-    for kv_cache in kv_types {
+    for (kv_cache, kv_cache_v) in kv_types {
         for (batch, ubatch) in batches {
             for fit_target in fit_targets {
-                let id = format!("dense-{kv_cache}-fit{fit_target}-b{batch}-ub{ubatch}");
+                let id =
+                    cache_candidate_id("dense", kv_cache, kv_cache_v, fit_target, batch, ubatch);
                 if candidates.iter().any(|candidate| candidate.id == id) {
                     continue;
                 }
@@ -728,6 +735,7 @@ fn dense_candidates(requested_context: u64) -> Vec<CandidateConfig> {
                     batch: Some(batch),
                     ubatch: Some(ubatch),
                     kv_cache: Some(kv_cache.to_string()),
+                    kv_cache_v: (kv_cache_v != kv_cache).then(|| kv_cache_v.to_string()),
                     fit_target: Some(fit_target),
                     gpu_layers: None,
                     cpu_moe: false,
@@ -747,25 +755,27 @@ fn dense_candidates(requested_context: u64) -> Vec<CandidateConfig> {
 
 fn moe_candidates(metadata: &GgufMetadata, requested_context: u64) -> Vec<CandidateConfig> {
     let mut candidates = Vec::new();
-    for kv_cache in ["q8_0", "q4_0"] {
-        for (batch, ubatch) in [(1024, 256), (8192, 2048), (16384, 4096)] {
-            candidates.push(CandidateConfig {
-                id: format!("moe-{kv_cache}-cpu-moe-b{batch}-ub{ubatch}"),
-                requested_context,
-                batch: Some(batch),
-                ubatch: Some(ubatch),
-                kv_cache: Some(kv_cache.to_string()),
-                fit_target: Some(1536),
-                gpu_layers: None,
-                cpu_moe: true,
-                n_cpu_moe: None,
-                threads: None,
-                threads_batch: None,
-                expected_risk: CandidateRisk::Low,
-                note: "MoE baseline with CPU expert offload enabled".to_string(),
-                planning_note: String::new(),
-            });
-        }
+    for (kv_cache, kv_cache_v) in [("q8_0", "q8_0"), ("q8_0", "q4_0"), ("q4_0", "q4_0")] {
+        candidates.push(CandidateConfig {
+            id: format!(
+                "moe-{}-cpu-moe-b1024-ub256",
+                cache_label(kv_cache, kv_cache_v)
+            ),
+            requested_context,
+            batch: Some(1024),
+            ubatch: Some(256),
+            kv_cache: Some(kv_cache.to_string()),
+            kv_cache_v: (kv_cache_v != kv_cache).then(|| kv_cache_v.to_string()),
+            fit_target: Some(1536),
+            gpu_layers: None,
+            cpu_moe: true,
+            n_cpu_moe: None,
+            threads: None,
+            threads_batch: None,
+            expected_risk: CandidateRisk::Low,
+            note: "MoE baseline with CPU expert offload enabled".to_string(),
+            planning_note: String::new(),
+        });
     }
 
     let mut n_cpu_moe_values = vec![44, 40, 36, 34, 33, 32, 31, 30, 28, 24];
@@ -784,10 +794,13 @@ fn moe_candidates(metadata: &GgufMetadata, requested_context: u64) -> Vec<Candid
     n_cpu_moe_values.sort_unstable_by(|left, right| right.cmp(left));
     n_cpu_moe_values.dedup();
 
-    for kv_cache in ["q8_0", "q4_0"] {
-        for (batch, ubatch) in [(16384, 4096), (32768, 4096), (16384, 2048), (8192, 2048)] {
-            for n_cpu_moe in &n_cpu_moe_values {
-                let id = format!("moe-{kv_cache}-ncpumoe{n_cpu_moe}-b{batch}-ub{ubatch}");
+    for (batch, ubatch) in [(16384, 4096), (32768, 4096), (16384, 2048), (8192, 2048)] {
+        for n_cpu_moe in &n_cpu_moe_values {
+            for (kv_cache, kv_cache_v) in [("q8_0", "q8_0"), ("q8_0", "q4_0"), ("q4_0", "q4_0")] {
+                let id = format!(
+                    "moe-{}-ncpumoe{n_cpu_moe}-b{batch}-ub{ubatch}",
+                    cache_label(kv_cache, kv_cache_v)
+                );
                 if candidates.iter().any(|candidate| candidate.id == id) {
                     continue;
                 }
@@ -797,6 +810,7 @@ fn moe_candidates(metadata: &GgufMetadata, requested_context: u64) -> Vec<Candid
                     batch: Some(batch),
                     ubatch: Some(ubatch),
                     kv_cache: Some(kv_cache.to_string()),
+                    kv_cache_v: (kv_cache_v != kv_cache).then(|| kv_cache_v.to_string()),
                     fit_target: Some(1536),
                     gpu_layers: None,
                     cpu_moe: false,
@@ -819,6 +833,7 @@ fn moe_candidates(metadata: &GgufMetadata, requested_context: u64) -> Vec<Candid
             batch: Some(1024),
             ubatch: Some(256),
             kv_cache: Some("q8_0".to_string()),
+            kv_cache_v: None,
             fit_target: Some(1536),
             gpu_layers: None,
             cpu_moe: true,
@@ -929,9 +944,10 @@ fn candidate_risk(
     let Some(total_vram_mib) = total_vram_mib else {
         return CandidateRisk::Medium;
     };
-    let kv_risk_mib = match candidate.kv_cache.as_deref() {
-        Some("q8_0") => candidate.requested_context / 128,
-        Some("q4_0") => candidate.requested_context / 256,
+    let kv_risk_mib = match cache_precision(candidate) {
+        (8, 8) => candidate.requested_context / 128,
+        (8, 4) => candidate.requested_context.saturating_mul(3) / 512,
+        (4, 4) => candidate.requested_context / 256,
         _ => candidate.requested_context / 192,
     };
     let working_set = model_mib.saturating_add(kv_risk_mib);
@@ -975,10 +991,48 @@ fn best_by<'a>(
     score: impl Fn(&ProfileResult) -> f64,
 ) -> Option<&'a ProfileResult> {
     results.iter().copied().max_by(|left, right| {
-        score(left)
-            .partial_cmp(&score(right))
-            .unwrap_or(Ordering::Equal)
+        cache_precision(&left.candidate)
+            .cmp(&cache_precision(&right.candidate))
+            .then_with(|| {
+                score(left)
+                    .partial_cmp(&score(right))
+                    .unwrap_or(Ordering::Equal)
+            })
     })
+}
+
+pub(crate) fn cache_precision(candidate: &CandidateConfig) -> (u8, u8) {
+    let k = cache_bits(candidate.kv_cache.as_deref());
+    let v = cache_bits(
+        candidate
+            .kv_cache_v
+            .as_deref()
+            .or(candidate.kv_cache.as_deref()),
+    );
+    (k, v)
+}
+
+fn cache_bits(value: Option<&str>) -> u8 {
+    match value {
+        Some("q8_0") => 8,
+        Some("q4_0") => 4,
+        _ => 0,
+    }
+}
+
+fn cache_label(k: &str, v: &str) -> String {
+    if k == v {
+        k.to_string()
+    } else {
+        format!("{k}-{v}")
+    }
+}
+
+fn cache_candidate_id(prefix: &str, k: &str, v: &str, fit: u64, batch: u64, ubatch: u64) -> String {
+    format!(
+        "{prefix}-{}-fit{fit}-b{batch}-ub{ubatch}",
+        cache_label(k, v)
+    )
 }
 
 fn generation_score(result: &ProfileResult) -> f64 {
@@ -1154,6 +1208,31 @@ mod tests {
         assert_eq!(fast.source_run_id, "slow-safe");
         assert!(recs.rejected.iter().any(|run| run.run_id == "fast-tight"));
         assert!(recs.rejected.iter().any(|run| run.run_id == "oom"));
+    }
+
+    #[test]
+    fn recommendations_prefer_highest_safe_kv_precision_before_speed() {
+        let gguf = fake_metadata(Some("Q4_K_M"));
+        let mut q8_q8 = fake_result("q8-q8", &gguf, 10.0, 100.0, Some(799), Outcome::Pass);
+        q8_q8.candidate.kv_cache = Some("q8_0".to_string());
+        let mut q8_q4 = fake_result("q8-q4", &gguf, 20.0, 200.0, Some(900), Outcome::Pass);
+        q8_q4.candidate.kv_cache = Some("q8_0".to_string());
+        q8_q4.candidate.kv_cache_v = Some("q4_0".to_string());
+        let mut q4_q4 = fake_result("q4-q4", &gguf, 40.0, 400.0, Some(1200), Outcome::Pass);
+        q4_q4.candidate.kv_cache = Some("q4_0".to_string());
+
+        let recs = build_recommendations(
+            PathBuf::from("/models/test.gguf"),
+            &[q8_q8, q8_q4, q4_q4],
+            &SafetyLimits::default(),
+            Some(&fake_environment()),
+        );
+
+        assert!(
+            recs.profiles
+                .iter()
+                .all(|profile| profile.source_run_id == "q8-q4")
+        );
     }
 
     #[test]
@@ -1333,6 +1412,10 @@ mod tests {
         let candidates = generate_candidates(&metadata, Preset::Standard, 262_144, Some(8));
         assert!(candidates[0].cpu_moe);
         assert!(candidates.iter().any(|candidate| candidate.cpu_moe));
+        assert!(candidates.iter().any(|candidate| {
+            candidate.kv_cache.as_deref() == Some("q8_0")
+                && candidate.kv_cache_v.as_deref() == Some("q4_0")
+        }));
         assert!(
             candidates
                 .iter()
@@ -1407,6 +1490,7 @@ mod tests {
                 batch: None,
                 ubatch: None,
                 kv_cache: None,
+                kv_cache_v: None,
                 fit_target: None,
                 gpu_layers: None,
                 cpu_moe: false,

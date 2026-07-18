@@ -32,13 +32,20 @@ core count, RAM/swap totals, GPU backend, GPU inventory/driver, or
 `llama-server` executable/help output changes, old runs are kept as stale
 evidence and excluded from best-observed-profile selection.
 
+After applying the VRAM and swap safety gates, recommendations prefer the
+highest tested KV-cache precision before comparing throughput: `q8_0/q8_0`,
+then `q8_0/q4_0`, then `q4_0/q4_0`. The selected workload score breaks ties
+between candidates at the same precision. The default minimum free-VRAM floor
+is 800 MiB. This is an explicit long-context operating policy; the profiler
+still does not claim to measure model intelligence or recall quality directly.
+
 ## Dense Models
 
 Dense models usually have no MoE offload escape hatch, so the useful sweep is:
 
 - context cap
 - batch and microbatch
-- KV cache type, starting with `q8_0` and then `q4_0`
+- KV cache type, covering `q8_0/q8_0`, mixed `q8_0/q4_0`, and `q4_0/q4_0`
 - `--fit-target`, from safer high values toward tighter low values
 
 Dense recommendations should be skeptical of speed gains that leave very little
@@ -96,9 +103,10 @@ The primary `--max-runs` budget does not include these up to five refinement run
 ## Final-Stage Realistic Validation
 
 After placement search and any accepted thread refinement, `standard` and
-`thorough` rank the current safe candidates by balanced throughput and validate
-the best observed candidate with one combined request. `quick` does this only
-with `--validate-best`. When `--confirm-best` is enabled, confirmation runs are
+`thorough` rank the current safe candidates by KV-cache precision first and
+balanced throughput within each precision tier, then validate the first
+candidate with one combined request. `quick` does this only with
+`--validate-best`. When `--confirm-best` is enabled, confirmation runs are
 combined with their baseline by median throughput before this ranking, and the
 eventual validated recommendation retains the repeated-measurement count. The
 prompt target is
@@ -153,11 +161,14 @@ server/request settings. `--probe-mode generic` omits those settings.
 Profiles are the best observed configurations among runs that pass safety
 limits:
 
-- `interactive-fast`: best observed generation speed.
-- `interactive-safe`: best observed generation speed with at least 1 GiB free
-  VRAM.
-- `prompt-replay`: best observed prompt ingest speed.
-- `balanced`: best observed harmonic mean of generation and prompt ingest speed.
+- `interactive-fast`: highest-precision safe configuration, with generation
+  speed breaking same-precision ties.
+- `interactive-safe`: the same precision-first selection under the configured
+  free-VRAM floor.
+- `prompt-replay`: highest-precision safe configuration, with prompt ingest
+  speed breaking same-precision ties.
+- `balanced`: highest-precision safe configuration, with balanced throughput
+  breaking same-precision ties.
 
 Rejected runs keep a compact reason: OOM, timeout, server crash, too-tight VRAM
 or swap use, severe realistic-validation degradation, interrupted, or

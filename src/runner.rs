@@ -667,9 +667,13 @@ async fn run_realistic_validation(
     telemetry_source: &TelemetrySource,
 ) -> Result<()> {
     candidates.sort_by(|left, right| {
-        balanced_throughput(right)
-            .partial_cmp(&balanced_throughput(left))
-            .unwrap_or(std::cmp::Ordering::Equal)
+        crate::profile::cache_precision(&right.candidate)
+            .cmp(&crate::profile::cache_precision(&left.candidate))
+            .then_with(|| {
+                balanced_throughput(right)
+                    .partial_cmp(&balanced_throughput(left))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
     });
     let mut seen = BTreeSet::new();
     candidates.retain(|result| seen.insert(result.candidate.id.clone()));
@@ -1151,6 +1155,7 @@ fn prepend_explicit_n_cpu_moe_candidates(
             batch: Some(16_384),
             ubatch: Some(4_096),
             kv_cache: Some("q8_0".to_string()),
+            kv_cache_v: None,
             fit_target: Some(1_536),
             gpu_layers: None,
             cpu_moe: false,
@@ -1178,6 +1183,7 @@ fn same_candidate_shape(left: &CandidateConfig, right: &CandidateConfig) -> bool
         && left.batch == right.batch
         && left.ubatch == right.ubatch
         && left.kv_cache == right.kv_cache
+        && left.kv_cache_v == right.kv_cache_v
         && left.fit_target == right.fit_target
         && left.gpu_layers == right.gpu_layers
         && left.cpu_moe == right.cpu_moe
@@ -1195,9 +1201,16 @@ fn candidate_aggressiveness(candidate: &CandidateConfig) -> i64 {
     let fit = candidate
         .fit_target
         .map_or(0, |value| (2048_i64 - value.min(2048) as i64).max(0) / 128);
-    let kv = match candidate.kv_cache.as_deref() {
-        Some("q8_0") => 2,
-        Some("q4_0") => 1,
+    let kv = match (
+        candidate.kv_cache.as_deref(),
+        candidate
+            .kv_cache_v
+            .as_deref()
+            .or(candidate.kv_cache.as_deref()),
+    ) {
+        (Some("q8_0"), Some("q8_0")) => 3,
+        (Some("q8_0"), Some("q4_0")) => 2,
+        (Some("q4_0"), Some("q4_0")) => 1,
         _ => 0,
     };
     let moe = if candidate.cpu_moe {
@@ -1228,6 +1241,7 @@ pub async fn run_fullctx(path: &Path, options: FullCtxOptions) -> Result<Profile
                     batch: Some(512),
                     ubatch: Some(128),
                     kv_cache: Some("q4_0".to_string()),
+                    kv_cache_v: None,
                     fit_target: Some(1536),
                     gpu_layers: None,
                     cpu_moe: false,
@@ -2253,10 +2267,11 @@ fn build_command(
         } else if capabilities.supports("--cache-type-k") {
             args.extend(["--cache-type-k".to_string(), kv_cache.clone()]);
         }
+        let value_cache = candidate.kv_cache_v.as_ref().unwrap_or(kv_cache);
         if capabilities.supports("-ctv") {
-            args.extend(["-ctv".to_string(), kv_cache.clone()]);
+            args.extend(["-ctv".to_string(), value_cache.clone()]);
         } else if capabilities.supports("--cache-type-v") {
-            args.extend(["--cache-type-v".to_string(), kv_cache.clone()]);
+            args.extend(["--cache-type-v".to_string(), value_cache.clone()]);
         }
     }
     if let Some(gpu_layers) = candidate.gpu_layers {
@@ -3052,6 +3067,26 @@ llama_perf_context_print:        prompt eval time =   1000.00 ms / 16000 tokens 
     }
 
     #[test]
+    fn build_command_supports_mixed_k_and_v_cache_precision() {
+        let capabilities = ServerCapabilities {
+            executable: "llama-server".to_string(),
+            help: "--model --host --port -c -ctk -ctv".to_string(),
+        };
+        let mut candidate = test_candidate("mixed-cache", 1024, 256, 1536);
+        candidate.kv_cache_v = Some("q4_0".to_string());
+        let metadata = test_result(candidate.clone(), Outcome::Pass, Some(4096)).gguf;
+        let command = build_command(
+            &capabilities,
+            &metadata,
+            &candidate,
+            18080,
+            ProbeMode::Generic,
+        );
+        assert!(command.windows(2).any(|pair| pair == ["-ctk", "q8_0"]));
+        assert!(command.windows(2).any(|pair| pair == ["-ctv", "q4_0"]));
+    }
+
+    #[test]
     fn explicit_n_cpu_moe_candidates_are_prepended() {
         let metadata = GgufMetadata {
             path: PathBuf::from("/models/test.gguf"),
@@ -3256,6 +3291,7 @@ llama_perf_context_print:        prompt eval time =   1000.00 ms / 16000 tokens 
             batch: Some(batch),
             ubatch: Some(ubatch),
             kv_cache: Some("q8_0".to_string()),
+            kv_cache_v: None,
             fit_target: Some(fit_target),
             gpu_layers: None,
             cpu_moe: id.contains("cpu-moe"),

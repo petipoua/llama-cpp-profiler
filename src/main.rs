@@ -67,7 +67,7 @@ struct TuneArgs {
     probe_mode: ProbeMode,
     #[arg(long)]
     max_runs: Option<usize>,
-    #[arg(long, default_value_t = 512)]
+    #[arg(long, default_value_t = 800)]
     min_vram_free_mib: u64,
     #[arg(long, default_value_t = 1024)]
     max_swap_delta_mib: u64,
@@ -120,7 +120,7 @@ struct RecommendArgs {
     goal: WorkloadGoal,
     #[arg(long, default_value_t = 18_080)]
     port: u16,
-    #[arg(long, default_value_t = 512)]
+    #[arg(long, default_value_t = 800)]
     min_vram_free_mib: u64,
     #[arg(long, default_value_t = 1024)]
     max_swap_delta_mib: u64,
@@ -160,7 +160,7 @@ struct FullCtxArgs {
     ctx: Option<u64>,
     #[arg(long, value_enum, default_value_t = ProbeMode::Thinking)]
     probe_mode: ProbeMode,
-    #[arg(long, default_value_t = 512)]
+    #[arg(long, default_value_t = 800)]
     min_vram_free_mib: u64,
     #[arg(long, default_value_t = 1024)]
     max_swap_delta_mib: u64,

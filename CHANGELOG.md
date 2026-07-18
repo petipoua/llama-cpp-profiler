@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Prefer the highest tested KV-cache precision that clears the configured
+  VRAM/swap safety gates: Q8/Q8, then Q8/Q4, then Q4/Q4.
+- Use workload throughput only to choose between safe candidates at the same
+  KV-cache precision.
+- Add mixed Q8/Q4 candidate generation and raise the default free-VRAM floor to
+  800 MiB.
+
 ## 0.1.0-beta.1
 
 First focused beta release for Linux `llama-server` profiling.

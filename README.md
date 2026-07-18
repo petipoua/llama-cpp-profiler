@@ -80,6 +80,11 @@ throughput, `prompt` favors prompt ingest, and `balanced` is the default:
 llama-cpp-profiler recommend ~/Models/<model-or-gguf> --preset quick --goal prompt
 ```
 
+All goals first prefer the highest tested KV-cache precision that clears the
+VRAM/swap safety gates: Q8/Q8, then Q8/Q4, then Q4/Q4. Throughput selects among
+configurations only after that precision choice. The default free-VRAM floor is
+800 MiB and can be overridden with `--min-vram-free-mib`.
+
 `tune` starts one `llama-server` at a time on localhost ports beginning at `18180`,
 runs sanity/output/ingest probes, writes raw artifacts, and stops the server after
 each candidate. It can promote safer or more aggressive already-planned
@@ -94,7 +99,8 @@ input tokens, with output space reserved) and up to 1024 output tokens. This
 final validation is outside the primary-search and thread-refinement budgets.
 
 Use `--confirm-best` when repeatability matters. It reruns up to three promising
-candidates and ranks them by median throughput before final-stage validation.
+candidates and uses their median throughput within each KV-precision tier before
+final-stage validation.
 The selected realistic-validation result retains the repeated-measurement count
 and `confirmed` confidence, reducing noise from clock changes, cache warming,
 and background desktop activity.
@@ -119,10 +125,11 @@ llama-cpp-profiler tune ~/Models/<model-or-gguf> --preset quick --validate-best
 ```
 
 The final stage scales its timeout from the selected candidate's short-probe
-throughput and tries the next balanced candidate after a crash, timeout, safety
-violation, or severe retained-throughput collapse. Early EOS is recorded as
-incomplete but still passes. Reports show actual prompt/output token counts and
-retained prompt and generation throughput.
+throughput and tries candidates in precision-first order—Q8/Q8, Q8/Q4, then
+Q4/Q4—with balanced throughput breaking same-precision ties. It advances after
+a crash, timeout, safety violation, or severe retained-throughput collapse.
+Early EOS is recorded as incomplete but still passes. Reports show actual
+prompt/output token counts and retained prompt and generation throughput.
 
 Use `--probe-mode generic` to omit reasoning-specific server arguments and request
 fields. Thinking mode remains the default.
@@ -220,7 +227,7 @@ llama-cpp-profiler export PATH [--markdown] [--opencode PATH] [--dry-run] [--wri
   `--ctx` caps it or supplies the fallback when native context is absent.
 - Candidate plans try that native/explicit context first. Lower-context fallbacks
   are available for adaptive promotion after failed or too-tight runs.
-- Safety defaults are `--min-vram-free-mib 512` and `--max-swap-delta-mib 1024`.
+- Safety defaults are `--min-vram-free-mib 800` and `--max-swap-delta-mib 1024`.
 - `quick` runs at most 6 candidates; `standard` runs at most 16; `thorough`
   runs at most 48.
 - These limits apply to the primary placement search. A CPU-participating
@@ -231,8 +238,8 @@ llama-cpp-profiler export PATH [--markdown] [--opencode PATH] [--dry-run] [--wri
   least 3%.
 - `standard` and `thorough` add final-stage realistic validation after thread
   refinement. `quick` adds it only with `--validate-best`. Failed candidates fall
-  back in balanced-score order; a failed validation disqualifies its short-probe
-  baseline from recommendations.
+  back in KV-precision order, with balanced score breaking same-precision ties;
+  a failed validation disqualifies its short-probe baseline from recommendations.
 - Plain `tune` and `recommend` default to `quick`; `standard` and `thorough` are explicit deeper modes.
 - `--goal balanced` is the default. It places the matching `balanced`, `interactive-fast`, or `prompt-replay` profile first in tune output; `recommend` uses that primary profile unless `--profile` is explicit.
 - `--confirm-best` reruns up to three safe, promising candidates, uses median
@@ -287,11 +294,14 @@ whether generation ended before the 1024-token ceiling.
 Recommendations are the best observed configurations derived from
 current-environment passed runs and safety limits:
 
-- `interactive-fast`: best observed generation throughput within safety limits.
-- `interactive-safe`: best observed generation throughput with at least 1 GiB
-  free VRAM.
-- `prompt-replay`: best observed prompt eval throughput within safety limits.
-- `balanced`: best observed harmonic mean of prompt and output throughput.
+- `interactive-fast`: highest-precision safe configuration, with generation
+  throughput breaking same-precision ties.
+- `interactive-safe`: the same precision-first selection under the configured
+  free-VRAM floor.
+- `prompt-replay`: highest-precision safe configuration, with prompt throughput
+  breaking same-precision ties.
+- `balanced`: highest-precision safe configuration, with balanced throughput
+  breaking same-precision ties.
 
 ### Requirements
 

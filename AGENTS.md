@@ -13,6 +13,10 @@ Preferred workflow for agents:
    final-stage realistic validation. Add `--validate-best` when a quick run also
    needs that validation. The final tune summary includes the selected metrics
    and exact next `serve` command.
+   Recommendation selection first applies the configured VRAM/swap safety gates,
+   then prefers KV-cache precision in the order Q8/Q8, Q8/Q4, Q4/Q4. Workload
+   throughput breaks ties only within the same precision tier. The default free
+   VRAM floor is 800 MiB.
 4. Use `report --agent` as the token-saving interface before reading raw logs.
 5. Use `serve --profile interactive-fast --print` to get the exact server command.
 

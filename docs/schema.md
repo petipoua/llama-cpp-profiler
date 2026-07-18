@@ -1,7 +1,9 @@
 # Data Schemas
 
 The schemas are versioned by `schema_version`; the current beta schema version is
-`6`. Version `6` added workload goals, search coverage, recommendation confidence,
+`7`. Version `7` added separate mixed K/V cache representation and
+precision-first recommendation selection. Version `6` added workload goals,
+search coverage, recommendation confidence,
 and repeated-measurement counts. Version `5` added realistic-validation metadata
 and outcomes. Version `4` added optional candidate thread counts and
 thread-refinement run kinds. Version `3` added versioned model identity and
@@ -23,8 +25,9 @@ Important fields:
 - `gguf`: parsed GGUF metadata, including architecture, native context, quant, MoE expert counts, and chat-template presence.
 - `command`: argv array used to launch `llama-server`.
 - `command_display`: shell-escaped command string.
-- `candidate`: generated tuning config: context, batch, microbatch, KV cache type,
-  fit target, GPU layer count, MoE placement flags, optional `threads` and
+- `candidate`: generated tuning config: context, batch, microbatch, K-cache type
+  in `kv_cache`, an optional distinct V-cache type in `kv_cache_v`, fit target,
+  GPU layer count, MoE placement flags, optional `threads` and
   `threads_batch`, expected risk, note, and planning note. Null thread values use
   llama.cpp defaults.
 - `candidate.expected_risk`, `candidate.planning_note`: hardware-aware planning annotations.
@@ -75,7 +78,8 @@ Important fields:
 - `generated_at`
 - `model_path`
 - `model_identity`
-- `profiles`: ranked profile recommendations.
+- `profiles`: recommendations selected by safe KV-cache precision first, with
+  each profile's workload score breaking same-precision ties.
 - `rejected`: failed, OOM, timeout, swap-heavy, or too-tight candidate summaries.
 - `stale`: legacy or changed-environment run summaries excluded from ranking.
 - `environment`: current environment used when rebuilding recommendations.
@@ -88,6 +92,8 @@ Important fields:
 Each profile contains:
 
 - `id`: `interactive-fast`, `interactive-safe`, `prompt-replay`, or `balanced`.
+  Each profile prefers Q8/Q8, then Q8/Q4, then Q4/Q4 after safety filtering;
+  its workload-specific throughput score breaks ties within that precision.
 - `role`: human-readable role.
 - `source_run_id`: run that produced the profile.
 - `source_candidate_id`, `source_test_kind`, `requested_context`
