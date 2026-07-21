@@ -6,7 +6,7 @@ speed—context, throughput, TTFT, memory headroom, and failures—not intellige
 coding quality, or model alignment.
 
 It's a tool i use to optimize how my codex agent onboard a new local model that I want to tune for my machine's specific hardware 
-to run with the highest tok/sec possible and using as much available VRAM as possible with a small margin.
+to run with the highest tok/sec possible and using as much available VRAM as possible (with a 800MB margin).
 
 It is designed primarily for consumer Linux systems with a single GPU. It is
 not a multi-GPU tuning or placement tool.
